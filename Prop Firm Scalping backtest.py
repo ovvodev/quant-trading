@@ -319,7 +319,15 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
     """
 
     d = df.copy()
-    d['date'] = pd.to_datetime(d['timestamp'], utc=True).dt.tz_convert(tz)
+    ts_utc = pd.to_datetime(d['timestamp'], utc=True)
+    if tz.startswith('UTC') and (len(tz) == 3 or tz[3] in '+-'):
+        # fixed offset, no daylight saving (matches Pine's "UTC-5" session
+        # timezone convention exactly) - tz_convert would apply a real,
+        # DST-shifting IANA zone instead, which is a different thing.
+        offset_hours = int(tz[3:]) if len(tz) > 3 else 0
+        d['date'] = ts_utc.dt.tz_localize(None) + pd.Timedelta(hours=offset_hours)
+    else:
+        d['date'] = ts_utc.dt.tz_convert(tz)
     d['price'] = d['close']
 
     d['ema_fast'] = d['close'].ewm(span=ema_fast, adjust=False).mean()
@@ -424,11 +432,13 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
     tr['pnl_price'] = (tr['exit_price'] - tr['entry_price']) * tr['side']
     tr['stop_dist'] = stop_mult * tr['entry_vol']
     tr['r_multiple'] = tr['pnl_price'] / tr['stop_dist']
-    tr['entry_date'] = d['date'].reset_index(drop=True).loc[tr['entry_idx']].values
-    tr['exit_date'] = d['date'].reset_index(drop=True).loc[tr['exit_idx']].values
-    tr['entry_date'] = pd.to_datetime(tr['entry_date'], utc=True).dt.tz_convert(tz)
-    tr['exit_date'] = pd.to_datetime(tr['exit_date'], utc=True).dt.tz_convert(tz)
-    tr['day'] = tr['entry_date'].dt.date
+    # index straight off d['date'] (already in the right local time/tz from
+    # above) rather than round-tripping through pd.to_datetime(utc=True),
+    # which would silently mis-handle the tz-naive fixed-offset branch.
+    d_date_reset = d['date'].reset_index(drop=True)
+    tr['entry_date'] = d_date_reset.loc[tr['entry_idx']].values
+    tr['exit_date'] = d_date_reset.loc[tr['exit_idx']].values
+    tr['day'] = pd.DatetimeIndex(tr['entry_date']).date
 
     return tr, d
 
@@ -516,12 +526,84 @@ def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
     return out, summary
 
 
+def backtesting_v5_legacy(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
+                           daily_loss_pct=DAILY_LOSS_LIMIT_PCT,
+                           max_dd_pct=MAX_DRAWDOWN_LIMIT_PCT,
+                           profit_target_pct=PROFIT_TARGET_PCT,
+                           point_value=1.0):
+    """faithfully reproduces the position sizing of the ORIGINAL v5 Pine
+    script (the one attached and re-tested by hand in TradingView), bug
+    and all, purely so its reported result can be checked against real
+    MNQ data rather than argued about.
+
+    the v5 script computes qty = riskAmount / stopDist with NO division by
+    point_value, and allows fractional qty (no whole-contract floor). on a
+    spot fx pair (point_value == 1) that is exactly correct. on MNQ
+    (point_value == 2) it is not: TradingView still multiplies the
+    realized profit of every filled contract by the instrument's real
+    point value automatically, so this sizing formula silently asks for
+    2x the number of contracts the intended risk_pct implies - i.e. every
+    trade actually risks 2x the configured risk_pct. commission and
+    slippage are 0, matching that script's defaults. see backtesting() for
+    the corrected sizing (divides by point_value, floors to whole
+    contracts) used everywhere else in this file.
+    """
+    equity = initial_equity
+    peak_equity = initial_equity
+    max_dd = 0.0
+    day_start_equity = initial_equity
+    current_day = None
+    halted = False
+    day_halted = False
+    target_hit_day = None
+    rows = []
+
+    for _, row in tr.iterrows():
+        day = row['day']
+        if current_day != day:
+            current_day = day
+            day_start_equity = equity
+            day_halted = False
+
+        if halted or day_halted or target_hit_day is not None:
+            rows.append({**row, 'executed': False, 'trade_pnl': 0.0, 'equity': equity})
+            continue
+
+        risk_amount = equity * risk_pct
+        units = risk_amount / row['stop_dist']            # <- no point_value division (the bug)
+        if units <= 0:
+            rows.append({**row, 'executed': False, 'trade_pnl': 0.0, 'equity': equity})
+            continue
+
+        trade_pnl = units * row['pnl_price'] * point_value  # TradingView still applies it here
+        equity += trade_pnl
+
+        peak_equity = max(peak_equity, equity)
+        dd = (peak_equity - equity) / peak_equity
+        max_dd = max(max_dd, dd)
+
+        if (day_start_equity - equity) / day_start_equity >= daily_loss_pct:
+            day_halted = True
+        if dd >= max_dd_pct:
+            halted = True
+        if target_hit_day is None and (equity - initial_equity) / initial_equity >= profit_target_pct:
+            target_hit_day = day
+
+        rows.append({**row, 'executed': True, 'trade_pnl': trade_pnl, 'equity': equity})
+
+    out = pd.DataFrame(rows)
+    summary = dict(initial_equity=initial_equity, final_equity=equity,
+                    max_dd=max_dd, halted=halted, target_hit_day=target_hit_day)
+    return out, summary
+
+
 def backtesting_cycles(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
                         daily_loss_pct=DAILY_LOSS_LIMIT_PCT,
                         max_dd_pct=MAX_DRAWDOWN_LIMIT_PCT,
                         profit_target_pct=PROFIT_TARGET_PCT,
                         point_value=1.0, whole_contracts=False,
-                        commission_round_trip=0.0, slippage_ticks=0.0, tick_size=0.0):
+                        commission_round_trip=0.0, slippage_ticks=0.0, tick_size=0.0,
+                        legacy_sizing=False):
     """same money management as backtesting(), but over a multi-year trade
     list a single continuous run is the wrong lens: the first time the
     account fails its drawdown limit, backtesting() locks it forever and
@@ -560,7 +642,10 @@ def backtesting_cycles(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
             continue
 
         risk_amount = state['equity'] * risk_pct
-        units = risk_amount / (row['stop_dist'] * point_value)
+        # legacy_sizing replicates the original v5 script's formula, which
+        # omits the point_value division (see backtesting_v5_legacy()) -
+        # only meaningful when point_value != 1.
+        units = risk_amount / row['stop_dist'] if legacy_sizing else risk_amount / (row['stop_dist'] * point_value)
         if whole_contracts:
             units = np.floor(units)
             if units < 1:
