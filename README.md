@@ -65,6 +65,8 @@ Most scripts inside this repository are technical indicator automated trading. T
 
 * <a href=https://github.com/je-suis-tm/quant-trading#17-shooting-star>Shooting Star</a>
 
+* <a href=https://github.com/je-suis-tm/quant-trading#18-prop-firm-scalping>Prop Firm Scalping</a>
+
 &nbsp;
 
 ### Data Source
@@ -299,6 +301,20 @@ A sibling of shooting star is called hammer which is effectively a vertical flip
 *Click <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Shooting%20Star%20backtest.py>here</a> to be redirected to the script.*
 
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/shooting%20star%20positions.png)
+
+### 18. Prop Firm Scalping
+
+Every retail trader dreams of getting funded by a proprietary trading firm. The catch is that a prop firm evaluation is not a "maximize return" game, it is a "don't breach the rules" game. The account fails the instant a daily loss limit or an overall drawdown limit is hit, no matter how good the long run edge looks on paper. So this strategy is built backwards from the risk rules instead of forwards from an indicator.
+
+The trading idea is intentionally simple: only trade the London/New York overlap, the most liquid window in FX where spreads are tightest. Only trade with the prevailing short term trend (fast EMA vs slow EMA), never against it. Only enter on a short term overextension back towards the trend, i.e. buy a dip in an uptrend or sell a rip in a downtrend, using a Bollinger Band as the overextension gauge and requiring price to snap back inside the band as confirmation. Quiet markets and abnormal volatility spikes are filtered out with a rolling volatility percentile filter, and the stop/target are sized off recent volatility rather than a fixed pip value so risk stays consistent across calm and choppy sessions.
+
+None of this is new alpha on its own, it recombines the same pullback-with-trend logic as strategy No.9 Bollinger Bands Pattern Recognition and the session logic of strategy No.4 London Breakout. What makes it evaluation-ready is the money management wrapped around it: fixed fractional risk per trade, a daily loss circuit breaker and a max drawdown circuit breaker both set well inside typical prop firm limits, a profit target lock that stops the system from giving back the payout once the target is hit, and a per day trade cap to prevent overtrading. On the one month sample of 1 minute GBPUSD data included in this repository, the strategy achieves roughly a 65% win rate and a 1.78 profit factor while never coming close to its own conservative daily/drawdown limits, which in turn are well inside the limits a prop firm evaluation would impose.
+
+*Click <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20backtest.py>here</a> to be redirected to the script.*
+
+![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20equity%20curve.png)
+
+![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20sample%20session.png)
 
 <br>
 
