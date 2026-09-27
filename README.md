@@ -310,7 +310,7 @@ The trading idea is intentionally simple: only trade the London/New York overlap
 
 None of this is new alpha on its own, it recombines the same pullback-with-trend logic as strategy No.9 Bollinger Bands Pattern Recognition and the session logic of strategy No.4 London Breakout. What makes it evaluation-ready is the money management wrapped around it: fixed fractional risk per trade, a daily loss circuit breaker and a max drawdown circuit breaker both set well inside typical prop firm limits, a profit target lock that stops the system from giving back the payout once the target is hit, and a per day trade cap to prevent overtrading. On the one month sample of 1 minute GBPUSD data included in this repository, the strategy achieves roughly a 65% win rate and a 1.78 profit factor while never coming close to its own conservative daily/drawdown limits, which in turn are well inside the limits a prop firm evaluation would impose.
 
-*Click <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20backtest.py>here</a> to be redirected to the script.*
+*Click <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20backtest.py>here</a> to be redirected to the Python backtest, or <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20strategy.pine>here</a> for the Pine Script v5 port ready to paste into TradingView.*
 
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20equity%20curve.png)
 
