@@ -310,11 +310,17 @@ The trading idea is intentionally simple: only trade the London/New York overlap
 
 None of this is new alpha on its own, it recombines the same pullback-with-trend logic as strategy No.9 Bollinger Bands Pattern Recognition and the session logic of strategy No.4 London Breakout. What makes it evaluation-ready is the money management wrapped around it: fixed fractional risk per trade, a daily loss circuit breaker and a max drawdown circuit breaker both set well inside typical prop firm limits, a profit target lock that stops the system from giving back the payout once the target is hit, and a per day trade cap to prevent overtrading. On the one month sample of 1 minute GBPUSD data included in this repository, the strategy achieves roughly a 65% win rate and a 1.78 profit factor while never coming close to its own conservative daily/drawdown limits, which in turn are well inside the limits a prop firm evaluation would impose.
 
-*Click <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20backtest.py>here</a> to be redirected to the Python backtest, or <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20strategy.pine>here</a> for the Pine Script v5 port ready to paste into TradingView.*
+The script also ships a Pine Script v6 version for TradingView, and an honest second data point: backtesting the same architecture on 5 years of real 1 minute MNQ (Micro E-mini Nasdaq-100 futures) OHLC data, with stops/targets checked against bar high/low rather than close. The FX-tuned session and parameters have no edge at all on MNQ (profit factor ~0.98). Widening the session to the full US cash session and shortening the target relative to the stop turns up a small, genuinely out-of-sample-consistent edge (~56-61% win rate, profit factor ~1.02-1.05 gross, holding up every year from 2021 to 2026) - but simulated as repeated evaluation cycles (reset after every pass or fail, rather than one continuous run that freezes at the first drawdown breach), that edge passes roughly 57% of cycles gross and only about 12% of cycles once realistic commission and slippage are included. The edge is real but too thin, at this trade frequency, to survive execution costs on this instrument. Both scripts print/plot this gross-vs-net comparison directly rather than hiding it; see the "MNQ findings" comment in the Python script for the full numbers.
+
+*Click <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20backtest.py>here</a> to be redirected to the Python backtest, or <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20strategy.pine>here</a> for the Pine Script v6 port ready to paste into TradingView.*
 
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20equity%20curve.png)
 
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20sample%20session.png)
+
+![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20mnq%20equity%20curve.png)
+
+![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20mnq%20sample%20session.png)
 
 <br>
 

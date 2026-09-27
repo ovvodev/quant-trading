@@ -48,9 +48,29 @@
 //     TradingView's strategy tester fills them against bar high/low, which
 //     is more realistic than the close-only approximation used in the
 //     original Python prototype.
-//   - this is an educational strategy. backtest results assume the
-//     commission/slippage you configure below; validate against your own
-//     broker/exchange fee schedule before trading a live evaluation.
+//   - this is an educational strategy. commission_value/slippage below
+//     default to a low-cost-broker MNQ estimate ($0.35/fill + 1 tick/fill,
+//     i.e. $0.70 + 2 ticks round trip) rather than 0, because on real 5
+//     year MNQ data (see the repo's Python backtest and the "MNQ FINDING"
+//     note below) this exact architecture's gross edge is thin enough that
+//     ignoring costs materially overstates it. adjust both in the Strategy
+//     Tester's Properties tab to match your own broker's fee schedule.
+//
+// MNQ FINDING (from backtesting on 5 years of real MNQ 1-minute OHLC data,
+// 2021-09 to 2026-09, stop/target checked against bar high/low): the
+// FX-tuned session/parameters (09:30-11:30 NY "open", stop=3x/target=2x
+// vol) have NO edge on MNQ (profit factor ~0.98). widening to the full
+// 09:30-16:00 RTH session with stop=3x/target=1.5x turns up a small,
+// genuinely out-of-sample-consistent edge (~56-61% win rate, profit factor
+// ~1.02-1.05 GROSS across every year 2021-2026). simulated as repeated
+// evaluation cycles (reset after every pass/fail rather than one frozen
+// run), that gross edge passes about 57% of cycles - but net of the
+// realistic costs above, it drops to roughly a 12% pass rate. the edge is
+// real but too thin, at this trade frequency, to survive execution costs.
+// treat the defaults below as the "least bad" config found, not a proven
+// winner, and see the Python backtest's "MNQ findings" comment for the
+// full numbers and suggested next steps (fewer/larger trades, or a
+// momentum/breakout signal instead of mean-reversion pullback).
 // =============================================================================
 
 strategy("Prop Firm Scalping Strategy", overlay = true,
@@ -58,16 +78,16 @@ strategy("Prop Firm Scalping Strategy", overlay = true,
      default_qty_type = strategy.fixed,
      pyramiding = 0,
      commission_type = strategy.commission.cash_per_contract,
-     commission_value = 0,
-     slippage = 0,
+     commission_value = 0.35,
+     slippage = 1,
      process_orders_on_close = false)
 
 // ------------------------------------------------------------------ inputs
 grpAsset = "Instrument"
-string assetPreset = input.string("MNQ / Index Futures (US open)", "Instrument Preset",
-     options = ["MNQ / Index Futures (US open)", "FX Major (London/NY overlap)", "Custom (use Session inputs below)"],
+string assetPreset = input.string("MNQ / Index Futures (full RTH)", "Instrument Preset",
+     options = ["MNQ / Index Futures (full RTH)", "FX Major (London/NY overlap)", "Custom (use Session/Signal inputs below)"],
      group = grpAsset,
-     tooltip = "Sets a sensible default trading session per asset class. Pick Custom to fully control the Session group below.")
+     tooltip = "Sets the trading session AND the stop/target multiples that were actually validated per asset class (see the MNQ FINDING note up top). Pick Custom to fully control the Signal/Session groups below.")
 float pointValueOverride = input.float(0.0, "Point Value Override (0 = auto from syminfo.pointvalue)", group = grpAsset, minval = 0.0)
 bool wholeContractsOnly = input.bool(true, "Round position size down to whole contracts/units", group = grpAsset,
      tooltip = "Keep ON for futures (MNQ, ES, ...). Safe to leave ON for FX too, it just rounds units down.")
@@ -81,8 +101,8 @@ int volLen       = input.int(60,  "Volatility Window (ATR-proxy)", group = grpSi
 int volLookback  = input.int(500, "Volatility Percentile Lookback", group = grpSignal)
 float minVolPct  = input.float(30, "Min Volatility Percentile", group = grpSignal)
 float maxVolPct  = input.float(97, "Max Volatility Percentile", group = grpSignal)
-float stopMult   = input.float(3.0, "Stop = x * Volatility",  group = grpSignal, step = 0.1)
-float targetMult = input.float(2.0, "Target = x * Volatility", group = grpSignal, step = 0.1)
+float customStopMult   = input.float(3.0, "Stop = x * Volatility (used when preset = Custom)",  group = grpSignal, step = 0.1)
+float customTargetMult = input.float(2.0, "Target = x * Volatility (used when preset = Custom)", group = grpSignal, step = 0.1)
 int maxHoldMin   = input.int(45,  "Max Holding Minutes",    group = grpSignal)
 int maxTradesDay = input.int(5,   "Max Trades Per Day",     group = grpSignal)
 
@@ -97,17 +117,27 @@ float maxDDPct     = input.float(8.0, "Max Drawdown Limit %", group = grpRisk, s
 float profitTgtPct = input.float(10.0, "Profit Target % (lock, stop risking further)", group = grpRisk, step = 0.5) / 100
 
 // ------------------------------------------------------- instrument preset
-// (kept as two single-value switches rather than one tuple-returning switch,
+// (kept as single-value switches rather than one tuple-returning switch,
 // since Pine's switch branches must all resolve to the same scalar type)
 string sessionInput = switch assetPreset
-    "MNQ / Index Futures (US open)" => "0930-1130"
-    "FX Major (London/NY overlap)"  => "0800-1200"
+    "MNQ / Index Futures (full RTH)" => "0930-1600"
+    "FX Major (London/NY overlap)"   => "0800-1200"
     => customSession
 
 string sessionTz = switch assetPreset
-    "MNQ / Index Futures (US open)" => "America/New_York"
-    "FX Major (London/NY overlap)"  => "UTC-5"
+    "MNQ / Index Futures (full RTH)" => "America/New_York"
+    "FX Major (London/NY overlap)"   => "UTC-5"
     => customSessionTz
+
+float stopMult = switch assetPreset
+    "MNQ / Index Futures (full RTH)" => 3.0
+    "FX Major (London/NY overlap)"   => 3.0
+    => customStopMult
+
+float targetMult = switch assetPreset
+    "MNQ / Index Futures (full RTH)" => 1.5
+    "FX Major (London/NY overlap)"   => 2.0
+    => customTargetMult
 
 // ------------------------------------------------------------- indicators
 float emaFast = ta.ema(close, emaFastLen)

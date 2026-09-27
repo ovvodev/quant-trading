@@ -87,10 +87,44 @@ MAX_TRADES_PER_DAY = 5   # trade cap to avoid overtrading
 
 INSTRUMENT_PRESETS = {
     'GBPUSD': dict(point_value=1.0, tick_size=0.0001, whole_contracts=False,
-                    session_start='08:00', session_end='12:00', tz_note='EST fixed (histdata.com convention)'),
+                    session_start='08:00', session_end='12:00', stop_mult=3.0, target_mult=2.0,
+                    commission_round_trip=0.0, slippage_ticks=0.0,
+                    tz_note='EST fixed (histdata.com convention)'),
+    # session/stop/target below are the config that actually held up out of
+    # sample on 5 years of real MNQ 1-min data - see the "MNQ findings" note
+    # further down. commission/slippage are a low-cost-broker estimate
+    # ($0.35/side + 1 tick/side): re-validate against your own broker.
     'MNQ': dict(point_value=2.0, tick_size=0.25, whole_contracts=True,
-                 session_start='09:30', session_end='11:30', tz_note='America/New_York (US cash equity open)'),
+                 session_start='09:30', session_end='16:00', stop_mult=3.0, target_mult=1.5,
+                 commission_round_trip=0.70, slippage_ticks=2.0,
+                 tz_note='America/New_York (full RTH - see note below on why NOT just the open)'),
 }
+
+# ---------------------------------------------------------------------------
+# MNQ findings (from backtesting on data/MNQ_1m_v2_clean.parquet, 5 years,
+# 2021-09 to 2026-09, real OHLC bars with stop/target checked against bar
+# high/low rather than close only)
+# ---------------------------------------------------------------------------
+# porting the FX parameters and session as-is (09:30-11:30 NY "open" window,
+# stop=3x/target=2x vol) produces a profit factor of 0.98 and a slightly
+# negative average R - i.e. no edge, not "less profitable", actually a
+# loser. widening the session to the full RTH (09:30-16:00) and shortening
+# the target relative to the stop (3x/1.5x) turns up a small, statistically
+# consistent edge: ~56-59% win rate and profit factor ~1.02-1.05, holding up
+# across every year 2021-2026 including a genuine out-of-sample 2024-2026
+# test split. HOWEVER that gross edge averages only about $0.25-0.50 per
+# micro contract per trade, which is smaller than a realistic round trip
+# cost (commission + 1-2 ticks of slippage, roughly $1.50-2.00/contract on
+# ~1,200 trades/year for this config). net of costs this specific
+# architecture (1 minute bars, mean-reversion pullback against a slow ema
+# trend filter) is NOT a tradeable scalp on MNQ - the edge is real but too
+# thin to survive execution costs at this trade frequency. see
+# statistics(..., label=) output for the gross-vs-net comparison main()
+# prints for MNQ. widening the stop/target further (holding longer, trading
+# less often) would dilute per-trade cost drag but stops being a "scalp";
+# a different edge (breakout/momentum rather than mean-reversion) was not
+# exhaustively tested and remains the most promising next step.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # prop firm evaluation parameters (buffered well inside typical rules)
@@ -256,11 +290,155 @@ def signal_generation(df, ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
     return tr, d
 
 
+def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
+                            bb_win=BB_WINDOW, bb_k=BB_K, vol_win=VOL_WINDOW,
+                            vol_pctrank_lookback=500,
+                            stop_mult=STOP_MULT, target_mult=TARGET_MULT,
+                            min_vol_pct=MIN_VOL_PCT, max_vol_pct=MAX_VOL_PCT,
+                            session_start=SESSION_START, session_end=SESSION_END,
+                            max_hold=MAX_HOLD_MINUTES, max_trades_day=MAX_TRADES_PER_DAY):
+    """same strategy as signal_generation(), adapted for real OHLC bars
+    (futures data) instead of a single mid-price series:
+
+      - stop/target are checked against the bar's high/low, not just its
+        close, matching how a real stop/limit order (and TradingView's
+        strategy tester) actually fills - this is a stricter, more
+        realistic test than the fx prototype's close-only approximation.
+      - the volatility filter uses a CAUSAL rolling percentile
+        (pandas .rolling().rank(pct=True), the exact same thing as Pine's
+        ta.percentrank) instead of signal_generation()'s whole-sample
+        quantile. that whole-sample quantile is fine for a one-month
+        sample where the price barely moves, but it both peeks at future
+        data and silently assumes a stable volatility regime - neither
+        holds over a multi-year sample where the instrument's price (and
+        therefore its point-denominated volatility) can move several
+        multiples, so it would misjudge "quiet" vs "wild" using a
+        regime from years away.
+      - day/session boundaries are computed in the instrument's own
+        session timezone (tz), not the raw timestamp column's timezone.
+    """
+
+    d = df.copy()
+    d['date'] = pd.to_datetime(d['timestamp'], utc=True).dt.tz_convert(tz)
+    d['price'] = d['close']
+
+    d['ema_fast'] = d['close'].ewm(span=ema_fast, adjust=False).mean()
+    d['ema_slow'] = d['close'].ewm(span=ema_slow, adjust=False).mean()
+    d['trend'] = np.where(d['ema_fast'] > d['ema_slow'], 1, -1)
+
+    d['bb_mid'] = d['close'].rolling(bb_win).mean()
+    d['bb_std'] = d['close'].rolling(bb_win).std()
+    d['bb_upper'] = d['bb_mid'] + bb_k * d['bb_std']
+    d['bb_lower'] = d['bb_mid'] - bb_k * d['bb_std']
+
+    d['vol'] = d['close'].rolling(vol_win).std()
+    d['vol_pctrank'] = d['vol'].rolling(vol_pctrank_lookback).rank(pct=True)
+
+    def _to_minutes(hhmm):
+        h, m = str(hhmm).split(':')
+        return int(h) * 60 + int(m)
+
+    session_start_min = _to_minutes(session_start)
+    session_end_min = _to_minutes(session_end)
+
+    d['minute_of_day'] = d['date'].dt.hour * 60 + d['date'].dt.minute
+    d['day'] = d['date'].dt.date
+    in_session = ((d['minute_of_day'] >= session_start_min) & (d['minute_of_day'] < session_end_min)).values
+    ok_vol_arr = ((d['vol'] > 0) & (d['vol_pctrank'] >= min_vol_pct) & (d['vol_pctrank'] <= max_vol_pct)).values
+
+    opens, highs, lows, closes = d['open'].values, d['high'].values, d['low'].values, d['close'].values
+    lower, upper, trend, vol = d['bb_lower'].values, d['bb_upper'].values, d['trend'].values, d['vol'].values
+    minute_of_day, days = d['minute_of_day'].values, d['day'].values
+    bb_ready = ~np.isnan(lower)
+
+    trades = []
+    position = 0
+    entry_price = entry_idx = stop_price = target_price = None
+    trades_today = 0
+    current_day = None
+    was_below = was_above = False
+
+    n = len(d)
+    for i in range(n):
+        if current_day != days[i]:
+            current_day = days[i]
+            trades_today = 0
+            if position != 0:
+                trades.append((entry_idx, i - 1, position, entry_price, opens[i], 'day_end', vol[entry_idx]))
+                position = 0
+
+        if position == 0:
+            can_trade = in_session[i] and trades_today < max_trades_day and bb_ready[i] and ok_vol_arr[i]
+            if can_trade:
+                if trend[i] == 1 and closes[i] < lower[i]:
+                    was_below = True
+                elif trend[i] == 1 and was_below and closes[i] >= lower[i]:
+                    position = 1
+                    entry_price, entry_idx = closes[i], i
+                    stop_price = entry_price - stop_mult * vol[i]
+                    target_price = entry_price + target_mult * vol[i]
+                    trades_today += 1
+                    was_below = False
+                else:
+                    was_below = False
+
+                if trend[i] == -1 and closes[i] > upper[i]:
+                    was_above = True
+                elif trend[i] == -1 and was_above and closes[i] <= upper[i]:
+                    position = -1
+                    entry_price, entry_idx = closes[i], i
+                    stop_price = entry_price + stop_mult * vol[i]
+                    target_price = entry_price - target_mult * vol[i]
+                    trades_today += 1
+                    was_above = False
+                else:
+                    was_above = False
+        else:
+            exit_reason = None
+            exit_price = None
+            if position == 1:
+                if lows[i] <= stop_price:
+                    exit_reason, exit_price = 'stop', stop_price
+                elif highs[i] >= target_price:
+                    exit_reason, exit_price = 'target', target_price
+            else:
+                if highs[i] >= stop_price:
+                    exit_reason, exit_price = 'stop', stop_price
+                elif lows[i] <= target_price:
+                    exit_reason, exit_price = 'target', target_price
+
+            if exit_reason is None and (i - entry_idx) >= max_hold:
+                exit_reason, exit_price = 'time', closes[i]
+            if exit_reason is None and not in_session[i] and minute_of_day[i] >= session_end_min:
+                exit_reason, exit_price = 'session_end', closes[i]
+
+            if exit_reason is not None:
+                trades.append((entry_idx, i, position, entry_price, exit_price, exit_reason, vol[entry_idx]))
+                position = 0
+
+    if position != 0:
+        trades.append((entry_idx, n - 1, position, entry_price, closes[n - 1], 'eof', vol[entry_idx]))
+
+    tr = pd.DataFrame(trades, columns=['entry_idx', 'exit_idx', 'side', 'entry_price',
+                                        'exit_price', 'reason', 'entry_vol'])
+    tr['pnl_price'] = (tr['exit_price'] - tr['entry_price']) * tr['side']
+    tr['stop_dist'] = stop_mult * tr['entry_vol']
+    tr['r_multiple'] = tr['pnl_price'] / tr['stop_dist']
+    tr['entry_date'] = d['date'].reset_index(drop=True).loc[tr['entry_idx']].values
+    tr['exit_date'] = d['date'].reset_index(drop=True).loc[tr['exit_idx']].values
+    tr['entry_date'] = pd.to_datetime(tr['entry_date'], utc=True).dt.tz_convert(tz)
+    tr['exit_date'] = pd.to_datetime(tr['exit_date'], utc=True).dt.tz_convert(tz)
+    tr['day'] = tr['entry_date'].dt.date
+
+    return tr, d
+
+
 def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
                  daily_loss_pct=DAILY_LOSS_LIMIT_PCT,
                  max_dd_pct=MAX_DRAWDOWN_LIMIT_PCT,
                  profit_target_pct=PROFIT_TARGET_PCT,
-                 point_value=1.0, whole_contracts=False):
+                 point_value=1.0, whole_contracts=False,
+                 commission_round_trip=0.0, slippage_ticks=0.0, tick_size=0.0):
     """apply fixed fractional position sizing and prop firm risk limits
     to the trade list produced by signal_generation().
 
@@ -279,7 +457,13 @@ def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
     (1.0 for a spot fx unit, 2.0 for MNQ). whole_contracts=True floors the
     computed size to a whole number and SKIPS the trade if that rounds to
     zero, since futures cannot be sized fractionally the way fx units can.
+
+    commission_round_trip (dollars/contract) and slippage_ticks (round trip,
+    e.g. 2 = 1 tick each way) model real execution cost per contract per
+    trade. both default to 0 (frictionless), matching every other backtest
+    in this repository unless you explicitly opt in.
     """
+    cost_per_unit = commission_round_trip + slippage_ticks * tick_size * point_value
 
     equity = initial_equity
     peak_equity = initial_equity
@@ -310,7 +494,7 @@ def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
                 rows.append({**row, 'executed': False, 'trade_pnl': 0.0, 'equity': equity})
                 continue
 
-        trade_pnl = units * row['pnl_price'] * point_value
+        trade_pnl = units * (row['pnl_price'] * point_value - cost_per_unit)
         equity += trade_pnl
 
         peak_equity = max(peak_equity, equity)
@@ -332,7 +516,121 @@ def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
     return out, summary
 
 
-def statistics(out, summary):
+def backtesting_cycles(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
+                        daily_loss_pct=DAILY_LOSS_LIMIT_PCT,
+                        max_dd_pct=MAX_DRAWDOWN_LIMIT_PCT,
+                        profit_target_pct=PROFIT_TARGET_PCT,
+                        point_value=1.0, whole_contracts=False,
+                        commission_round_trip=0.0, slippage_ticks=0.0, tick_size=0.0):
+    """same money management as backtesting(), but over a multi-year trade
+    list a single continuous run is the wrong lens: the first time the
+    account fails its drawdown limit, backtesting() locks it forever and
+    the rest of the history just sits idle, which answers "would this one
+    attempt survive" rather than the question that actually matters for
+    "steady payouts" - if you kept re-entering a fresh evaluation (or a
+    fresh funded round) after every pass or fail, how often would you
+    actually pass, and how long does a pass or a fail typically take?
+
+    this resets equity/peak/day-tracking back to initial_equity every time
+    a cycle ends (profit target hit = pass, max drawdown breached = fail),
+    and returns one row per cycle instead of one frozen equity curve.
+    """
+    cost_per_unit = commission_round_trip + slippage_ticks * tick_size * point_value
+
+    def _new_cycle_state(start_day):
+        return dict(equity=initial_equity, peak_equity=initial_equity, max_dd=0.0,
+                    day_start_equity=initial_equity, current_day=None, day_halted=False,
+                    n_trades=0, start_day=start_day)
+
+    cycles = []
+    rows = []
+    state = _new_cycle_state(None)
+
+    for _, row in tr.iterrows():
+        day = row['day']
+        if state['start_day'] is None:
+            state['start_day'] = day
+        if state['current_day'] != day:
+            state['current_day'] = day
+            state['day_start_equity'] = state['equity']
+            state['day_halted'] = False
+
+        if state['day_halted']:
+            rows.append({**row, 'executed': False, 'trade_pnl': 0.0, 'equity': state['equity']})
+            continue
+
+        risk_amount = state['equity'] * risk_pct
+        units = risk_amount / (row['stop_dist'] * point_value)
+        if whole_contracts:
+            units = np.floor(units)
+            if units < 1:
+                rows.append({**row, 'executed': False, 'trade_pnl': 0.0, 'equity': state['equity']})
+                continue
+
+        trade_pnl = units * (row['pnl_price'] * point_value - cost_per_unit)
+        state['equity'] += trade_pnl
+        state['n_trades'] += 1
+
+        state['peak_equity'] = max(state['peak_equity'], state['equity'])
+        dd = (state['peak_equity'] - state['equity']) / state['peak_equity']
+        state['max_dd'] = max(state['max_dd'], dd)
+
+        if (state['day_start_equity'] - state['equity']) / state['day_start_equity'] >= daily_loss_pct:
+            state['day_halted'] = True
+
+        rows.append({**row, 'executed': True, 'trade_pnl': trade_pnl, 'equity': state['equity']})
+
+        outcome = None
+        if dd >= max_dd_pct:
+            outcome = 'failed_drawdown'
+        elif (state['equity'] - initial_equity) / initial_equity >= profit_target_pct:
+            outcome = 'passed'
+
+        if outcome is not None:
+            cycles.append(dict(outcome=outcome, start_day=state['start_day'], end_day=day,
+                                n_trades=state['n_trades'], final_equity=state['equity'],
+                                max_dd=state['max_dd']))
+            state = _new_cycle_state(None)
+
+    # an in-progress cycle at the end of the data isn't a pass or a fail yet
+    if state['n_trades'] > 0:
+        cycles.append(dict(outcome='in_progress', start_day=state['start_day'], end_day=None,
+                            n_trades=state['n_trades'], final_equity=state['equity'],
+                            max_dd=state['max_dd']))
+
+    out = pd.DataFrame(rows)
+    cycles_df = pd.DataFrame(cycles)
+    return out, cycles_df
+
+
+def summarize_cycles(cycles_df, label='MNQ - REPEATED EVALUATION CYCLES'):
+
+    finished = cycles_df[cycles_df['outcome'] != 'in_progress']
+    passed = finished[finished['outcome'] == 'passed']
+    failed = finished[finished['outcome'] == 'failed_drawdown']
+
+    print('=' * 60)
+    print(label)
+    print('=' * 60)
+    print(f"cycles completed          : {len(finished)}  (passed: {len(passed)}, failed: {len(failed)})")
+    if len(finished) > 0:
+        print(f"pass rate                 : {len(passed)/len(finished):.1%}")
+        print(f"avg trades per cycle      : {finished['n_trades'].mean():.1f}")
+        print(f"avg trading days per cycle: {finished.apply(lambda r: (r['end_day']-r['start_day']).days, axis=1).mean():.1f}")
+    if len(passed) > 0:
+        print(f"avg trades to pass        : {passed['n_trades'].mean():.1f}")
+    if len(failed) > 0:
+        print(f"avg trades to fail        : {failed['n_trades'].mean():.1f}")
+    still_running = cycles_df[cycles_df['outcome'] == 'in_progress']
+    if len(still_running) > 0:
+        row = still_running.iloc[0]
+        print(f"final (unfinished) cycle  : {row['n_trades']} trades in, "
+              f"equity {row['final_equity']:,.0f} ({(row['final_equity']/INITIAL_EQUITY-1):+.2%}), "
+              f"drawdown so far {row['max_dd']:.2%}")
+    return dict(n_cycles=len(finished), pass_rate=len(passed)/len(finished) if len(finished) else np.nan)
+
+
+def statistics(out, summary, label='PROP FIRM SCALPING - BACKTEST RESULTS'):
 
     executed = out[out['executed']]
     skipped = (~out['executed']).sum()
@@ -348,7 +646,7 @@ def statistics(out, summary):
     days_traded = out['day'].nunique()
 
     print('=' * 60)
-    print('PROP FIRM SCALPING - BACKTEST RESULTS')
+    print(label)
     print('=' * 60)
     print(f"trades generated          : {len(out)}")
     print(f"trades executed           : {int(executed.shape[0])} (skipped by risk limits: {skipped})")
@@ -390,7 +688,9 @@ def statistics(out, summary):
                 consistency_pct=consistency_pct)
 
 
-def plot(d, out):
+def plot(d, out, summary, title_prefix='Prop Firm Scalping',
+         equity_path='preview/prop firm scalping equity curve.png',
+         session_path='preview/prop firm scalping sample session.png'):
 
     executed = out[out['executed']].copy()
 
@@ -398,16 +698,16 @@ def plot(d, out):
     fig = plt.figure()
     ax = fig.add_subplot(111)
     equity_curve = pd.concat([
-        pd.Series([INITIAL_EQUITY], index=[executed['entry_date'].iloc[0]]),
+        pd.Series([summary['initial_equity']], index=[executed['entry_date'].iloc[0]]),
         executed.set_index('exit_date')['equity']
     ])
     equity_curve.plot(ax=ax)
-    plt.title('Prop Firm Scalping - Equity Curve')
+    plt.title(f'{title_prefix} - Equity Curve')
     plt.ylabel('equity ($)')
     plt.xlabel('date')
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig('preview/prop firm scalping equity curve.png')
+    plt.savefig(equity_path)
     plt.close(fig)
 
     # zoom into a single sample day to visualize entries/exits against price
@@ -427,13 +727,13 @@ def plot(d, out):
     bx.scatter(shorts['entry_date'], shorts['entry_price'], marker='v', c='r', s=80, label='SHORT', zorder=2)
     bx.scatter(day_trades['exit_date'], day_trades['exit_price'], marker='x', c='k', s=50, label='exit', zorder=2)
 
-    plt.title(f'Prop Firm Scalping - Sample Session ({sample_day})')
+    plt.title(f'{title_prefix} - Sample Session ({sample_day})')
     plt.ylabel('price')
     plt.xlabel('time')
     plt.legend(loc='best')
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig('preview/prop firm scalping sample session.png')
+    plt.savefig(session_path)
     plt.close(fig)
 
 
@@ -441,6 +741,54 @@ def main(instrument='GBPUSD', csv_path=None):
 
     preset = INSTRUMENT_PRESETS[instrument]
     base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if instrument == 'MNQ':
+        if csv_path is None:
+            csv_path = os.path.join(base_dir, 'data', 'MNQ_1m_v2_clean.parquet')
+        df = pd.read_parquet(csv_path)
+
+        tr, d = signal_generation_ohlc(df, tz='America/New_York',
+                                        stop_mult=preset['stop_mult'], target_mult=preset['target_mult'],
+                                        session_start=preset['session_start'], session_end=preset['session_end'])
+
+        # gross (frictionless, like every other backtest in this repo) vs
+        # net of a realistic commission+slippage estimate - see the "MNQ
+        # findings" note above for why this comparison is the whole point.
+        out_gross, summary_gross = backtesting(tr, point_value=preset['point_value'],
+                                                 whole_contracts=preset['whole_contracts'])
+        statistics(out_gross, summary_gross, label='MNQ - GROSS (frictionless, no commission/slippage)')
+
+        print()
+        out_net, summary_net = backtesting(tr, point_value=preset['point_value'],
+                                            whole_contracts=preset['whole_contracts'],
+                                            commission_round_trip=preset['commission_round_trip'],
+                                            slippage_ticks=preset['slippage_ticks'],
+                                            tick_size=preset['tick_size'])
+        statistics(out_net, summary_net,
+                   label=f"MNQ - NET (commission ${preset['commission_round_trip']:.2f}/contract "
+                         f"+ {preset['slippage_ticks']:.0f} ticks slippage per round trip)")
+
+        # a single continuous run halts forever at the first drawdown
+        # breach - see backtesting_cycles()'s docstring for why that isn't
+        # the right way to read 5 years of "would this pass evaluation
+        # after evaluation" data.
+        print()
+        _, cycles_gross = backtesting_cycles(tr, point_value=preset['point_value'],
+                                              whole_contracts=preset['whole_contracts'])
+        summarize_cycles(cycles_gross, label='MNQ - REPEATED CYCLES, GROSS (frictionless)')
+        print()
+        _, cycles_net = backtesting_cycles(tr, point_value=preset['point_value'],
+                                            whole_contracts=preset['whole_contracts'],
+                                            commission_round_trip=preset['commission_round_trip'],
+                                            slippage_ticks=preset['slippage_ticks'],
+                                            tick_size=preset['tick_size'])
+        summarize_cycles(cycles_net, label='MNQ - REPEATED CYCLES, NET of commission/slippage')
+
+        plot(d, out_net, summary_net, title_prefix='Prop Firm Scalping (MNQ, net of cost)',
+             equity_path=os.path.join(base_dir, 'preview', 'prop firm scalping mnq equity curve.png'),
+             session_path=os.path.join(base_dir, 'preview', 'prop firm scalping mnq sample session.png'))
+        return
+
     if csv_path is None:
         csv_path = os.path.join(base_dir, 'data', 'gbpusd.csv')
     df = pd.read_csv(csv_path)
@@ -450,7 +798,7 @@ def main(instrument='GBPUSD', csv_path=None):
     out, summary = backtesting(tr, point_value=preset['point_value'],
                                 whole_contracts=preset['whole_contracts'])
     statistics(out, summary)
-    plot(d, out)
+    plot(d, out, summary)
 
 
 if __name__ == '__main__':
