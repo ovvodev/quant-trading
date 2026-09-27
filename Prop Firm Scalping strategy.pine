@@ -35,6 +35,8 @@
 //   - a "Point Value Override" input for instruments Pine misreports, and a
 //     minimum-1-contract guard that SKIPS a trade rather than silently
 //     oversizing it when the risk % is too small for one contract
+//   - New York only by default (Asia/London off), futures-style $ trailing
+//     drawdown modes, and a fixed $ risk-per-trade option
 //
 // usage notes:
 //   - intended for a 1 minute chart. session/day-boundary logic assumes
@@ -49,42 +51,33 @@
 //     TradingView's strategy tester fills them against bar high/low, which
 //     is more realistic than the close-only approximation used in the
 //     original Python prototype.
-//   - this is an educational strategy. commission_value/slippage below
-//     default to a low-cost-broker MNQ estimate ($0.35/fill + 1 tick/fill,
-//     i.e. $0.70 + 2 ticks round trip) rather than 0, because on real 5
-//     year MNQ data (see the repo's Python backtest and the "MNQ FINDING"
-//     note below) this exact architecture's gross edge is thin enough that
-//     ignoring costs materially overstates it. adjust both in the Strategy
-//     Tester's Properties tab to match your own broker's fee schedule.
+//   - this is an educational strategy. commission_value/slippage default
+//     to a low-cost-broker MNQ estimate ($0.35/fill, 1 tick of slippage on
+//     each market/stop fill; the take-profit limit pays no slippage), and
+//     backtest_fill_limits_assumption = 1 makes a take-profit fill only
+//     when price trades one tick THROUGH it, not on a touch. adjust both in
+//     the Strategy Tester's Properties tab to your own broker/prop firm.
+//   - Drawdown Rule: "Percent of peak" is the FX-prop style (% daily loss,
+//     % max drawdown, % target). futures prop firms use the "$ trailing"
+//     modes instead - pick one and set the $ inputs to your firm's rules.
 //
-// MNQ FINDING (from backtesting on 5 years of real MNQ 1-minute OHLC data,
-// 2021-09 to 2026-09, stop/target checked against bar high/low): the
-// FX-tuned session/parameters (09:30-11:30 NY "open", stop=3x/target=2x
-// vol) have NO edge on MNQ (profit factor ~0.98). widening to the full
-// 09:30-16:00 RTH session with stop=3x/target=1.5x turns up a small,
-// genuinely out-of-sample-consistent edge (~56-61% win rate, profit factor
-// ~1.02-1.05 GROSS across every year 2021-2026). simulated as repeated
-// evaluation cycles (reset after every pass/fail rather than one frozen
-// run), that gross edge passes about 57% of cycles - but net of the
-// realistic costs above, it drops to roughly a 12% pass rate. the edge is
-// real but too thin, at this trade frequency, to survive execution costs.
-// treat the defaults below as the "least bad" config found, not a proven
-// winner, and see the Python backtest's "MNQ findings" comment for the
-// full numbers and suggested next steps (fewer/larger trades, or a
-// momentum/breakout signal instead of mean-reversion pullback).
-//
-// ALL SESSIONS FINDING: the Sessions group below lets Asia, London and
-// New York be traded independently or combined, and all three default ON.
-// tested honestly on the same 5 years of MNQ data: combining all three is
-// WORSE than New York alone, not better. Asia and London individually
-// carry no edge for this mean-reversion-pullback signal (profit factor
-// ~0.94-0.96 on their own) and just dilute the thin edge New York has -
-// simulated as repeated evaluation cycles, all-sessions passes ~8% of
-// cycles gross and 0 of 22 cycles net of realistic costs, versus New York
-// alone's ~57%/~12%. the toggles are there so you can test combinations
-// yourself, but the evidence says trade New York only and leave Asia/
-// London off unless you have a reason (a different symbol, a different
-// signal) to expect otherwise.
+// MNQ FINDING (re-tested 2026-09-27 on 5 years of MNQ 1-minute data,
+// 2021-09 to 2026-09, rolls back-adjusted, stop/target against bar
+// high/low, take-profit needing a one-tick trade-through):
+//   - the defaults (New York 09:30-16:00, stop 3x / target 1.5x vol) have
+//     NO statistically detectable edge: +0.007R per trade gross (t = 0.93),
+//     -0.007R net of costs. 2021 and 2024 lose even before costs.
+//   - the 61% win rate is mostly the payoff shape: with the stop twice as
+//     far as the target, a coin flip hits the target ~67% of the time.
+//   - none of 25 stop/target combinations is positive after costs.
+//   - under generic futures prop rules (50k, $3k target, $2k trailing),
+//     the net pass rate is 14-25%, BELOW the ~27-34% a zero-edge strategy
+//     with the same payoff shape achieves.
+//   - Asia and London lose on their own (-0.013R and -0.018R gross) and
+//     are OFF by default; enabling them only makes results worse.
+// treat this script as a well-instrumented test harness, not a strategy to
+// trade. see "Prop Firm Scalping review.md" in the repo for the full review
+// and the one lead that did better (a 30-minute opening range breakout).
 // =============================================================================
 
 strategy("Prop Firm Scalping Strategy", overlay = true,
@@ -94,6 +87,7 @@ strategy("Prop Firm Scalping Strategy", overlay = true,
      commission_type = strategy.commission.cash_per_contract,
      commission_value = 0.35,
      slippage = 1,
+     backtest_fill_limits_assumption = 1,
      process_orders_on_close = false)
 
 // ------------------------------------------------------------------ inputs
@@ -120,17 +114,17 @@ float customTargetMult = input.float(2.0, "Target = x * Volatility (used when pr
 int maxHoldMin   = input.int(45,  "Max Holding Minutes",    group = grpSignal)
 int maxTradesDay = input.int(5,   "Max Trades Per Day",     group = grpSignal)
 
-// SESSIONS - see the "ALL SESSIONS FINDING" note up top before turning
-// Asia/London on for real: on 5 years of MNQ data they carry no edge of
-// their own and dilute the one session (New York) that does. All three
-// are independently toggleable so you can test any combination yourself.
+// SESSIONS - New York only by default. on 5 years of MNQ data Asia and
+// London lose on their own; the toggles remain so combinations can be
+// tested. note the Max Trades Per Day cap is SHARED across sessions, so
+// with several on, early Asia/London trades use up New York's slots.
 grpSession = "Sessions"
-bool asiaOn      = input.bool(true, "Trade Asia Session", group = grpSession, inline = "asia")
+bool asiaOn      = input.bool(false, "Trade Asia Session", group = grpSession, inline = "asia")
 string asiaTime  = input.session("1900-0400", "", group = grpSession, inline = "asia")
-bool londonOn    = input.bool(true, "Trade London Session", group = grpSession, inline = "london")
+bool londonOn    = input.bool(false, "Trade London Session", group = grpSession, inline = "london")
 string londonTime = input.session("0300-1200", "", group = grpSession, inline = "london")
 bool nyOn        = input.bool(true, "Trade New York Session", group = grpSession, inline = "ny")
-string nyTime    = input.session("0800-1700", "", group = grpSession, inline = "ny")
+string nyTime    = input.session("0930-1600", "", group = grpSession, inline = "ny")
 string sessionsTz = input.string("America/New_York", "Sessions Timezone", options = ["America/New_York", "America/Chicago", "UTC-5", "UTC"], group = grpSession)
 
 grpRisk = "Prop Firm Risk Management"
@@ -138,6 +132,22 @@ float riskPct      = input.float(0.5, "Risk % of Equity per Trade", group = grpR
 float dailyLossPct = input.float(2.0, "Daily Loss Limit %",  group = grpRisk, step = 0.5) / 100
 float maxDDPct     = input.float(8.0, "Max Drawdown Limit %", group = grpRisk, step = 0.5) / 100
 float profitTgtPct = input.float(10.0, "Profit Target % (lock, stop risking further)", group = grpRisk, step = 0.5) / 100
+
+// FUTURES PROP RULES - most futures prop firms do not use the % rules above.
+// they use a DOLLAR max loss that trails the account's high-water mark,
+// either at the end of each day or intraday including open profit, and
+// is breached by OPEN losses. the trailing floor stops at the starting
+// balance. pick a futures mode to use the $ inputs below instead of the
+// % daily/drawdown/target inputs above. defaults are a generic 50k shape.
+grpProp = "Futures Prop Rules ($)"
+string ddMode      = input.string("Percent of peak (FX-style)", "Drawdown Rule",
+     options = ["Percent of peak (FX-style)", "Futures $ trailing, end of day", "Futures $ trailing, intraday"], group = grpProp)
+float maxLossUsd   = input.float(2000, "Max Loss $ (trailing)", group = grpProp, minval = 0)
+float targetUsd    = input.float(3000, "Profit Target $", group = grpProp, minval = 0)
+float dailyLossUsd = input.float(1000, "Daily Loss $ (0 = none)", group = grpProp, minval = 0)
+float riskUsd      = input.float(0, "Risk per Trade $ (0 = use Risk % above)", group = grpProp, minval = 0,
+     tooltip = "On a 50k futures evaluation, $250-500 per trade = 1-3 MNQ at a typical stop. One NQ contract usually risks more than $1,000, so NQ only fits much larger accounts.")
+bool usdMode = ddMode != "Percent of peak (FX-style)"
 
 // ------------------------------------------------------- instrument preset
 // (stop/target only now - session is independent, see the Sessions group)
@@ -210,12 +220,35 @@ peakEquity := math.max(peakEquity, closedEquity)
 float currentDD = peakEquity > 0 ? (peakEquity - closedEquity) / peakEquity : 0.0
 float dailyLoss = dayStartEquity > 0 ? (dayStartEquity - closedEquity) / dayStartEquity : 0.0
 
-if dailyLoss >= dailyLossPct
-    dayHalted := true
-if currentDD >= maxDDPct
-    permHalted := true
-if not targetHit and (closedEquity - strategy.initial_capital) / strategy.initial_capital >= profitTgtPct
-    targetHit := true
+// futures $ rules: high-water mark trails at the day's close ("end of day")
+// or bar by bar including open profit ("intraday"); the floor stops rising
+// once it reaches the starting balance. breach is checked on strategy.equity
+// (open PnL included) at each bar close - intrabar extremes are not visible
+// to Pine, so a real intraday rule can breach slightly earlier than shown.
+var float usdHwm = strategy.initial_capital
+if ddMode == "Futures $ trailing, end of day" and isNewDay
+    usdHwm := math.max(usdHwm, closedEquity)
+if ddMode == "Futures $ trailing, intraday"
+    usdHwm := math.max(usdHwm, strategy.equity)
+float usdFloor = math.min(usdHwm - maxLossUsd, strategy.initial_capital)
+
+if usdMode
+    if strategy.equity <= usdFloor
+        permHalted := true
+    if dailyLossUsd > 0 and dayStartEquity - strategy.equity >= dailyLossUsd
+        dayHalted := true
+    if not targetHit and closedEquity - strategy.initial_capital >= targetUsd
+        targetHit := true
+else
+    if dailyLoss >= dailyLossPct
+        dayHalted := true
+    if currentDD >= maxDDPct
+        permHalted := true
+    if not targetHit and (closedEquity - strategy.initial_capital) / strategy.initial_capital >= profitTgtPct
+        targetHit := true
+
+if (permHalted or dayHalted) and strategy.position_size != 0
+    strategy.close_all(comment = permHalted ? "max loss breached" : "daily loss hit")
 
 bool canTrade = inSession and tradesToday < maxTradesDay and okVol and not dayHalted and not permHalted and not targetHit and strategy.position_size == 0
 
@@ -251,7 +284,7 @@ else
 float pointValue = pointValueOverride > 0 ? pointValueOverride : syminfo.pointvalue
 float stopDist   = stopMult * vol
 float targetDist = targetMult * vol
-float riskAmount = closedEquity * riskPct
+float riskAmount = riskUsd > 0 ? riskUsd : closedEquity * riskPct
 float rawQty     = stopDist > 0 and pointValue > 0 ? riskAmount / (stopDist * pointValue) : na
 float qty        = wholeContractsOnly and not na(rawQty) ? math.floor(rawQty) : rawQty
 bool  qtyOk      = not na(qty) and qty >= (wholeContractsOnly ? 1.0 : syminfo.mintick)
@@ -302,8 +335,8 @@ if barstate.islast
     table.cell(statusTable, 1, 1, str.tostring(closedEquity, "#,##0"))
     table.cell(statusTable, 0, 2, "Total Return")
     table.cell(statusTable, 1, 2, str.tostring((closedEquity - strategy.initial_capital) / strategy.initial_capital * 100, "#.##") + "%")
-    table.cell(statusTable, 0, 3, "Drawdown")
-    table.cell(statusTable, 1, 3, str.tostring(currentDD * 100, "#.##") + "%")
+    table.cell(statusTable, 0, 3, usdMode ? "Room to Max Loss" : "Drawdown")
+    table.cell(statusTable, 1, 3, usdMode ? "$" + str.tostring(strategy.equity - usdFloor, "#,##0") : str.tostring(currentDD * 100, "#.##") + "%")
     table.cell(statusTable, 0, 4, "Today's PnL")
     table.cell(statusTable, 1, 4, str.tostring(-dailyLoss * 100, "#.##") + "%")
     table.cell(statusTable, 0, 5, "Trades Today")

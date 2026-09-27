@@ -42,13 +42,13 @@
 #
 # caveats (read before trading real money):
 #   - the sample data is one month of 1 minute GBPUSD mid price with no
-#     bid/ask spread, no commission and no slippage. real execution costs
-#     will eat into the edge, especially on a strategy with a sub 1:1
-#     average win. re-validate with your broker's own spread/commission
-#     schedule and a much longer history before risking a live evaluation.
-#   - one month of data is a single volatility regime. the parameters
-#     below were checked to stay profitable on both halves of the sample
-#     independently, but they are not immune to regime change.
+#     bid/ask spread, no commission and no slippage. on it the strategy
+#     makes 63 trades, ~63% win rate, profit factor ~1.5, t-stat 1.41 -
+#     not statistically significant, and most of the profit is in the
+#     second half of the month. (an earlier version reported PF 1.78; that
+#     figure relied on a volatility filter that peeked at future data.)
+#   - on 5 years of MNQ futures the same architecture has no edge after
+#     costs - see the "MNQ findings" note below.
 #   - this is an educational backtest, not investment advice.
 # ---------------------------------------------------------------------------
 
@@ -98,47 +98,81 @@ INSTRUMENT_PRESETS = {
                     session_start='08:00', session_end='12:00', stop_mult=3.0, target_mult=2.0,
                     commission_round_trip=0.0, slippage_ticks=0.0,
                     tz_note='EST fixed (histdata.com convention)'),
-    # session/stop/target below are the config that actually held up out of
-    # sample on 5 years of real MNQ 1-min data - see the "MNQ findings" note
-    # further down. commission/slippage are a low-cost-broker estimate
-    # ($0.35/side + 1 tick/side): re-validate against your own broker.
+    # session/stop/target below are the least-bad config found on 5 years of
+    # MNQ 1-min data - it has NO edge after costs, see the "MNQ findings"
+    # note further down. commission/slippage are a low-cost-broker estimate
+    # ($0.35/side, 1 tick per market fill): re-validate with your broker.
     'MNQ': dict(point_value=2.0, tick_size=0.25, whole_contracts=True,
                  session_start='09:30', session_end='16:00', stop_mult=3.0, target_mult=1.5,
-                 commission_round_trip=0.70, slippage_ticks=2.0,
+                 commission_round_trip=0.70, slippage_ticks=1.0,
                  tz_note='America/New_York (full RTH - see note below on why NOT just the open)'),
     # same signal/risk parameters as 'MNQ' above, but tradable in all three
     # major sessions (Asia + London + New York) instead of just the RTH -
     # see the "MNQ findings" note for how this compares.
     'MNQ_ALL_SESSIONS': dict(point_value=2.0, tick_size=0.25, whole_contracts=True,
                  sessions=ALL_SESSIONS, stop_mult=3.0, target_mult=1.5,
-                 commission_round_trip=0.70, slippage_ticks=2.0,
+                 commission_round_trip=0.70, slippage_ticks=1.0,
                  tz_note='America/New_York, Asia+London+New York sessions combined'),
+    # the full-size E-mini Nasdaq-100 (10x MNQ). NQ and MNQ track the same
+    # index, so the MNQ price file doubles as NQ data. commission per
+    # contract is higher in dollars but ~2x lower in index points, which is
+    # what matters against a points-denominated edge. the catch is size: one
+    # NQ contract at a typical stop risks ~$1,400, far more than a small
+    # prop account can afford per trade.
+    'NQ': dict(point_value=20.0, tick_size=0.25, whole_contracts=True,
+                session_start='09:30', session_end='16:00', stop_mult=3.0, target_mult=1.5,
+                commission_round_trip=3.00, slippage_ticks=1.0,
+                tz_note='America/New_York (full RTH), priced off the MNQ file'),
+}
+
+# generic futures prop firm evaluation shapes (illustrative round numbers in
+# the style most futures prop firms use, not any specific firm's rules).
+# unlike the % rules above, futures firms measure drawdown in DOLLARS,
+# trailing the account's high-water mark - either at the end of each day
+# ('eod') or tick by tick including open profit ('intraday') - and the
+# trailing floor stops moving once it reaches the starting balance.
+FUTURES_PROP_TEMPLATES = {
+    '50k, EOD trailing ($3k target / $2k max loss / $1k daily)': dict(
+        account=50000, target=3000, max_loss=2000, trailing='eod', daily_loss=1000),
+    '50k, intraday trailing ($3k target / $2.5k max loss)': dict(
+        account=50000, target=3000, max_loss=2500, trailing='intraday', daily_loss=None),
+    '150k, EOD trailing ($9k target / $4.5k max loss / $3k daily)': dict(
+        account=150000, target=9000, max_loss=4500, trailing='eod', daily_loss=3000),
 }
 
 # ---------------------------------------------------------------------------
-# MNQ findings (from backtesting on data/MNQ_1m_v2_clean.parquet, 5 years,
-# 2021-09 to 2026-09, real OHLC bars with stop/target checked against bar
-# high/low rather than close only)
+# MNQ findings (re-tested 2026-09-27 on data/MNQ_1m_v2_clean.parquet,
+# 2021-09 to 2026-09, contract rolls back-adjusted, stop/target checked
+# against bar high/low, take-profit needing a one-tick trade-through,
+# commission $0.70 round trip + 1 tick slippage per market fill)
 # ---------------------------------------------------------------------------
-# porting the FX parameters and session as-is (09:30-11:30 NY "open" window,
-# stop=3x/target=2x vol) produces a profit factor of 0.98 and a slightly
-# negative average R - i.e. no edge, not "less profitable", actually a
-# loser. widening the session to the full RTH (09:30-16:00) and shortening
-# the target relative to the stop (3x/1.5x) turns up a small, statistically
-# consistent edge: ~56-59% win rate and profit factor ~1.02-1.05, holding up
-# across every year 2021-2026 including a genuine out-of-sample 2024-2026
-# test split. HOWEVER that gross edge averages only about $0.25-0.50 per
-# micro contract per trade, which is smaller than a realistic round trip
-# cost (commission + 1-2 ticks of slippage, roughly $1.50-2.00/contract on
-# ~1,200 trades/year for this config). net of costs this specific
-# architecture (1 minute bars, mean-reversion pullback against a slow ema
-# trend filter) is NOT a tradeable scalp on MNQ - the edge is real but too
-# thin to survive execution costs at this trade frequency. see
-# statistics(..., label=) output for the gross-vs-net comparison main()
-# prints for MNQ. widening the stop/target further (holding longer, trading
-# less often) would dilute per-trade cost drag but stops being a "scalp";
-# a different edge (breakout/momentum rather than mean-reversion) was not
-# exhaustively tested and remains the most promising next step.
+# - the 'MNQ' preset (New York 09:30-16:00, stop 3x / target 1.5x vol) has
+#   NO statistically detectable edge: +0.007R per trade gross, t-stat 0.93
+#   (bootstrap 95% CI -0.008R..+0.023R), and -0.007R net of costs. 2021 and
+#   2024 are negative even before costs.
+# - the ~61% win rate is mostly the payoff shape, not the signal: with the
+#   stop twice as far away as the target, a random entry hits the target
+#   first ~2/3 of the time. flipping every trade's direction or picking it
+#   at random gives almost the same result.
+# - none of 25 stop/target combinations (stop 2-4x, target 1-3x) is
+#   positive net of costs; the best gross cell has t = 1.5.
+# - the best variant found (start 10:00, 90 minute time stop) is exactly
+#   break-even net (-0.0001R), after trying many variants - i.e. nothing.
+# - Asia (-0.018R gross) and London (-0.013R) lose on their own; adding
+#   them to New York only makes things worse (note the per day trade cap is
+#   shared across sessions, so raise max_trades_day for a fair comparison
+#   - it still loses: -0.006R gross with a 15/day cap).
+# - prop firm pass rates must be compared against a zero-edge strategy with
+#   the same payoff shape (zero_edge_trades()), which passes ~27-34% of
+#   evaluations by luck. net of costs this strategy passes 14-25% - worse
+#   than luck - under both the % rules and generic futures $-trailing rules.
+# - NQ (10x MNQ) pays ~2x less commission per index point but one contract
+#   risks ~$1,400 at a typical stop, so on a 50k evaluation almost every
+#   trade is skipped. MNQ is the only practical contract at prop sizes.
+# - the earlier claims in this repo (edge "holding up every year", pass
+#   rate 57%/12% gross/net) came from touch-only target fills, raw
+#   contract rolls and only 7-8 completed evaluation cycles; they do not
+#   survive the corrections above. see 'Prop Firm Scalping review.md'.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -165,6 +199,7 @@ def signal_generation(df, ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
                        bb_win=BB_WINDOW, bb_k=BB_K, vol_win=VOL_WINDOW,
                        stop_mult=STOP_MULT, target_mult=TARGET_MULT,
                        min_vol_pct=MIN_VOL_PCT, max_vol_pct=MAX_VOL_PCT,
+                       vol_pctrank_lookback=500,
                        session_start=SESSION_START, session_end=SESSION_END,
                        max_hold=MAX_HOLD_MINUTES, max_trades_day=MAX_TRADES_PER_DAY):
     """scan 1 minute price data and return one row per completed trade.
@@ -190,8 +225,12 @@ def signal_generation(df, ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
     d['bb_lower'] = d['bb_mid'] - bb_k * d['bb_std']
 
     # rolling std of price as a lightweight atr proxy (data has no high/low)
-    d['vol'] = d['price'].rolling(vol_win).std().bfill()
-    vol_lo, vol_hi = d['vol'].quantile(min_vol_pct), d['vol'].quantile(max_vol_pct)
+    d['vol'] = d['price'].rolling(vol_win).std()
+    # CAUSAL rolling percentile of volatility (same as Pine's ta.percentrank
+    # and signal_generation_ohlc()). an earlier version used a whole-sample
+    # quantile here, which peeks at future data - on the one month GBPUSD
+    # sample that lookahead alone inflated profit factor from ~1.45 to ~1.78.
+    d['vol_pctrank'] = d['vol'].rolling(vol_pctrank_lookback).rank(pct=True)
 
     def _to_minutes(hhmm):
         h, m = str(hhmm).split(':')
@@ -206,6 +245,7 @@ def signal_generation(df, ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
 
     prices, lower, upper = d['price'].values, d['bb_lower'].values, d['bb_upper'].values
     trend, vol, minute_of_day, days = d['trend'].values, d['vol'].values, d['minute_of_day'].values, d['day'].values
+    ok_vol_arr = ((d['vol'] > 0) & (d['vol_pctrank'] >= min_vol_pct) & (d['vol_pctrank'] <= max_vol_pct)).values
 
     trades = []
     position = 0                  # 0 flat, 1 long, -1 short
@@ -229,11 +269,15 @@ def signal_generation(df, ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
                 position = 0
 
         if position == 0:
-            ok_vol = (not np.isnan(vol[i])) and (vol_lo <= vol[i] <= vol_hi) and vol[i] > 0
             can_trade = in_session[i] and trades_today < max_trades_day and \
-                not np.isnan(lower[i]) and ok_vol
+                not np.isnan(lower[i]) and ok_vol_arr[i]
 
-            if can_trade:
+            if not can_trade:
+                # a band poke seen while not allowed to trade (outside the
+                # session, vol filter off, trade cap hit) must not arm an
+                # entry later - matches the Pine state machine
+                was_below = was_above = False
+            else:
                 # uptrend: wait for price to poke below the lower band,
                 # then enter long once it snaps back inside (the pullback
                 # is over, trend resumes)
@@ -312,7 +356,8 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
                             min_vol_pct=MIN_VOL_PCT, max_vol_pct=MAX_VOL_PCT,
                             session_start=SESSION_START, session_end=SESSION_END,
                             sessions=None,
-                            max_hold=MAX_HOLD_MINUTES, max_trades_day=MAX_TRADES_PER_DAY):
+                            max_hold=MAX_HOLD_MINUTES, max_trades_day=MAX_TRADES_PER_DAY,
+                            target_through_ticks=0.0, tick_size=0.25):
     """same strategy as signal_generation(), adapted for real OHLC bars
     (futures data) instead of a single mid-price series:
 
@@ -339,7 +384,19 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
     pair where start > end (like Asia's 19:00-04:00) is treated as
     wrapping past midnight. trading-day boundaries (the daily trade cap,
     the daily loss reset) stay anchored to the calendar date regardless -
-    only which bars count as "in session" changes.
+    only which bars count as "in session" changes. note the daily trade cap
+    is SHARED across all windows, so with several sessions on, early
+    (Asia/London) trades use up slots New York would otherwise get - raise
+    max_trades_day when comparing combinations fairly.
+
+    target_through_ticks: a resting limit order is only guaranteed a fill
+    when price trades THROUGH it, not when it merely touches it. setting
+    this to 1 requires the bar to exceed the target by one tick before the
+    target counts as filled (TradingView's backtest_fill_limits_assumption).
+
+    each trade also records mae_price/mfe_price, its maximum adverse/
+    favorable excursion in price, so intraday-trailing drawdown rules can be
+    checked against open (not just closed) PnL.
     """
 
     d = df.copy()
@@ -392,9 +449,11 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
     days = d['day'].values
     bb_ready = ~np.isnan(lower)
 
+    through = target_through_ticks * tick_size
     trades = []
     position = 0
     entry_price = entry_idx = stop_price = target_price = None
+    mae = mfe = 0.0
     trades_today = 0
     current_day = None
     was_below = was_above = False
@@ -405,16 +464,21 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
             current_day = days[i]
             trades_today = 0
             if position != 0:
-                trades.append((entry_idx, i - 1, position, entry_price, opens[i], 'day_end', vol[entry_idx]))
+                trades.append((entry_idx, i - 1, position, entry_price, opens[i], 'day_end', vol[entry_idx], mae, mfe))
                 position = 0
 
         if position == 0:
             can_trade = in_session[i] and trades_today < max_trades_day and bb_ready[i] and ok_vol_arr[i]
-            if can_trade:
+            if not can_trade:
+                # see signal_generation(): a poke seen while not allowed to
+                # trade must not arm a later entry (matches Pine)
+                was_below = was_above = False
+            else:
                 if trend[i] == 1 and closes[i] < lower[i]:
                     was_below = True
                 elif trend[i] == 1 and was_below and closes[i] >= lower[i]:
                     position = 1
+                    mae = mfe = 0.0
                     entry_price, entry_idx = closes[i], i
                     stop_price = entry_price - stop_mult * vol[i]
                     target_price = entry_price + target_mult * vol[i]
@@ -427,6 +491,7 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
                     was_above = True
                 elif trend[i] == -1 and was_above and closes[i] <= upper[i]:
                     position = -1
+                    mae = mfe = 0.0
                     entry_price, entry_idx = closes[i], i
                     stop_price = entry_price + stop_mult * vol[i]
                     target_price = entry_price - target_mult * vol[i]
@@ -438,14 +503,18 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
             exit_reason = None
             exit_price = None
             if position == 1:
+                mae = max(mae, min(entry_price - lows[i], entry_price - stop_price))
+                mfe = max(mfe, min(highs[i] - entry_price, target_price - entry_price))
                 if lows[i] <= stop_price:
                     exit_reason, exit_price = 'stop', stop_price
-                elif highs[i] >= target_price:
+                elif highs[i] >= target_price + through:
                     exit_reason, exit_price = 'target', target_price
             else:
+                mae = max(mae, min(highs[i] - entry_price, stop_price - entry_price))
+                mfe = max(mfe, min(entry_price - lows[i], entry_price - target_price))
                 if highs[i] >= stop_price:
                     exit_reason, exit_price = 'stop', stop_price
-                elif lows[i] <= target_price:
+                elif lows[i] <= target_price - through:
                     exit_reason, exit_price = 'target', target_price
 
             if exit_reason is None and (i - entry_idx) >= max_hold:
@@ -454,14 +523,14 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
                 exit_reason, exit_price = 'session_end', closes[i]
 
             if exit_reason is not None:
-                trades.append((entry_idx, i, position, entry_price, exit_price, exit_reason, vol[entry_idx]))
+                trades.append((entry_idx, i, position, entry_price, exit_price, exit_reason, vol[entry_idx], mae, mfe))
                 position = 0
 
     if position != 0:
-        trades.append((entry_idx, n - 1, position, entry_price, closes[n - 1], 'eof', vol[entry_idx]))
+        trades.append((entry_idx, n - 1, position, entry_price, closes[n - 1], 'eof', vol[entry_idx], mae, mfe))
 
     tr = pd.DataFrame(trades, columns=['entry_idx', 'exit_idx', 'side', 'entry_price',
-                                        'exit_price', 'reason', 'entry_vol'])
+                                        'exit_price', 'reason', 'entry_vol', 'mae_price', 'mfe_price'])
     tr['pnl_price'] = (tr['exit_price'] - tr['entry_price']) * tr['side']
     tr['stop_dist'] = stop_mult * tr['entry_vol']
     tr['r_multiple'] = tr['pnl_price'] / tr['stop_dist']
@@ -474,6 +543,14 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
     tr['day'] = pd.DatetimeIndex(tr['entry_date']).date
 
     return tr, d
+
+
+def trade_cost(reason, commission_round_trip, slippage_ticks, tick_size, point_value):
+    """dollar cost per contract of one round trip: commission, plus
+    slippage on each MARKET fill. the entry is always a market fill; the
+    exit is too unless it was the take-profit limit order."""
+    market_fills = 1 if reason == 'target' else 2
+    return commission_round_trip + market_fills * slippage_ticks * tick_size * point_value
 
 
 def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
@@ -501,13 +578,13 @@ def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
     computed size to a whole number and SKIPS the trade if that rounds to
     zero, since futures cannot be sized fractionally the way fx units can.
 
-    commission_round_trip (dollars/contract) and slippage_ticks (round trip,
-    e.g. 2 = 1 tick each way) model real execution cost per contract per
-    trade. both default to 0 (frictionless), matching every other backtest
-    in this repository unless you explicitly opt in.
+    commission_round_trip (dollars/contract) and slippage_ticks (ticks per
+    MARKET fill) model real execution cost per contract per trade. the entry
+    and every stop/time/session exit are market fills and pay slippage; a
+    target exit is a resting limit order and pays none (see trade_cost()).
+    both default to 0 (frictionless), matching every other backtest in this
+    repository unless you explicitly opt in.
     """
-    cost_per_unit = commission_round_trip + slippage_ticks * tick_size * point_value
-
     equity = initial_equity
     peak_equity = initial_equity
     max_dd = 0.0
@@ -537,7 +614,8 @@ def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
                 rows.append({**row, 'executed': False, 'trade_pnl': 0.0, 'equity': equity})
                 continue
 
-        trade_pnl = units * (row['pnl_price'] * point_value - cost_per_unit)
+        trade_pnl = units * (row['pnl_price'] * point_value -
+                             trade_cost(row['reason'], commission_round_trip, slippage_ticks, tick_size, point_value))
         equity += trade_pnl
 
         peak_equity = max(peak_equity, equity)
@@ -650,7 +728,6 @@ def backtesting_cycles(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
     a cycle ends (profit target hit = pass, max drawdown breached = fail),
     and returns one row per cycle instead of one frozen equity curve.
     """
-    cost_per_unit = commission_round_trip + slippage_ticks * tick_size * point_value
 
     def _new_cycle_state(start_day):
         return dict(equity=initial_equity, peak_equity=initial_equity, max_dd=0.0,
@@ -685,7 +762,8 @@ def backtesting_cycles(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
                 rows.append({**row, 'executed': False, 'trade_pnl': 0.0, 'equity': state['equity']})
                 continue
 
-        trade_pnl = units * (row['pnl_price'] * point_value - cost_per_unit)
+        trade_pnl = units * (row['pnl_price'] * point_value -
+                             trade_cost(row['reason'], commission_round_trip, slippage_ticks, tick_size, point_value))
         state['equity'] += trade_pnl
         state['n_trades'] += 1
 
@@ -719,6 +797,132 @@ def backtesting_cycles(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
     out = pd.DataFrame(rows)
     cycles_df = pd.DataFrame(cycles)
     return out, cycles_df
+
+
+def back_adjust_rolls(df):
+    """difference back-adjust a stitched futures series across contract
+    rolls. data/MNQ_1m_v2_clean.parquet splices contracts together raw, so
+    every roll leaves a jump of up to ~100 points in the price series that
+    no one could have traded - and most rolls land at 00:00 UTC, right at
+    the Asia open, where they distort the EMAs, Bollinger Bands and the
+    volatility filter. this shifts every bar before a roll by that roll's
+    open-vs-previous-close gap, so the series is continuous. (the gap also
+    contains whatever the market genuinely moved over that one minute or
+    weekend, which is the standard, accepted cost of back-adjusting.)
+    """
+    d = df.sort_values('timestamp').reset_index(drop=True).copy()
+    roll = d['symbol'] != d['symbol'].shift()
+    roll.iloc[0] = False
+    gap = (d['open'] - d['close'].shift()).where(roll, 0.0)
+    # each bar is shifted by the sum of every roll gap that comes after it
+    adj = gap[::-1].cumsum()[::-1].shift(-1).fillna(0.0)
+    for c in ['open', 'high', 'low', 'close']:
+        d[c] = d[c] + adj
+    return d
+
+
+def backtesting_futures_prop(tr, account, target, max_loss, trailing='eod', daily_loss=None,
+                              risk_usd=250.0, max_contracts=None, point_value=2.0,
+                              commission_round_trip=0.0, slippage_ticks=0.0, tick_size=0.25):
+    """repeated evaluation cycles under FUTURES prop firm rules (see
+    FUTURES_PROP_TEMPLATES), which differ from the % rules in
+    backtesting_cycles() in ways that matter:
+      - the max loss is a fixed dollar amount trailing the high-water mark,
+        which stops trailing once the floor reaches the starting balance
+      - the floor is breached by OPEN losses, not just closed ones, so each
+        trade's worst point (mae_price) is checked against it
+      - 'intraday' trailing also ratchets the floor up with open profit
+        (mfe_price) - a trade that runs up and comes back can raise the
+        floor and then fail the account, with no closed loss at all
+      - size is a fixed dollar risk per trade (risk_usd), floored to whole
+        contracts, trade skipped if even one contract risks more
+    daily_loss, when set, halts trading for the rest of that day (open
+    losses included). returns one row per cycle: passed / failed_drawdown /
+    in_progress.
+    """
+    def _new(start_day):
+        return dict(bal=account, hwm=account, day_start=account, day=None, day_halted=False,
+                    n_trades=0, start_day=start_day)
+
+    def _floor(st):
+        return min(st['hwm'] - max_loss, account)
+
+    cycles = []
+    st = _new(None)
+    for row in tr.itertuples(index=False):
+        day = row.day
+        if st['start_day'] is None:
+            st['start_day'] = day
+        if st['day'] != day:
+            if trailing == 'eod' and st['day'] is not None:
+                st['hwm'] = max(st['hwm'], st['bal'])
+            st['day'], st['day_start'], st['day_halted'] = day, st['bal'], False
+        if st['day_halted']:
+            continue
+
+        units = np.floor(risk_usd / (row.stop_dist * point_value))
+        if max_contracts is not None:
+            units = min(units, max_contracts)
+        if units < 1:
+            continue
+
+        cost = units * trade_cost(row.reason, commission_round_trip, slippage_ticks, tick_size, point_value)
+        worst = st['bal'] - units * row.mae_price * point_value
+        if trailing == 'intraday':
+            st['hwm'] = max(st['hwm'], st['bal'] + units * row.mfe_price * point_value)
+        st['n_trades'] += 1
+
+        outcome = None
+        if worst <= _floor(st):
+            st['bal'] = min(worst, _floor(st))
+            outcome = 'failed_drawdown'
+        else:
+            st['bal'] += units * row.pnl_price * point_value - cost
+            if trailing == 'intraday':
+                st['hwm'] = max(st['hwm'], st['bal'])
+            if st['bal'] <= _floor(st):
+                outcome = 'failed_drawdown'
+            elif st['bal'] - account >= target:
+                outcome = 'passed'
+            if daily_loss is not None and st['day_start'] - min(worst, st['bal']) >= daily_loss:
+                st['day_halted'] = True
+
+        if outcome is not None:
+            cycles.append(dict(outcome=outcome, start_day=st['start_day'], end_day=day,
+                                n_trades=st['n_trades'], final_equity=st['bal'], max_dd=np.nan))
+            st = _new(None)
+
+    if st['n_trades'] > 0:
+        cycles.append(dict(outcome='in_progress', start_day=st['start_day'], end_day=None,
+                            n_trades=st['n_trades'], final_equity=st['bal'], max_dd=np.nan))
+    return pd.DataFrame(cycles)
+
+
+def zero_edge_trades(tr, seed=0):
+    """the null hypothesis, built from the strategy's own trades: every
+    trade's result is shifted so the AVERAGE R multiple is exactly zero
+    (same win/loss shape, same sizes, no edge), then trades are shuffled.
+    a pass rate is only evidence of skill if it clearly beats this - a
+    coin with the same payoff shape passes a fair share of evaluations too.
+    """
+    rng = np.random.default_rng(seed)
+    out = tr.copy()
+    r = (tr['r_multiple'] - tr['r_multiple'].mean()).values
+    mae_r = (tr['mae_price'] / tr['stop_dist']).values if 'mae_price' in tr else None
+    mfe_r = (tr['mfe_price'] / tr['stop_dist']).values if 'mfe_price' in tr else None
+    perm = rng.permutation(len(tr))
+    out['r_multiple'] = r[perm]
+    out['pnl_price'] = out['r_multiple'] * out['stop_dist']
+    if mae_r is not None:
+        out['mae_price'] = mae_r[perm] * out['stop_dist']
+        out['mfe_price'] = mfe_r[perm] * out['stop_dist']
+    out['reason'] = tr['reason'].values[perm]
+    return out
+
+
+def pass_rate(cycles_df):
+    f = cycles_df[cycles_df['outcome'] != 'in_progress'] if len(cycles_df) else cycles_df
+    return (len(f), (f['outcome'] == 'passed').mean() if len(f) else np.nan)
 
 
 def summarize_cycles(cycles_df, label='MNQ - REPEATED EVALUATION CYCLES'):
@@ -770,7 +974,9 @@ def statistics(out, summary, label='PROP FIRM SCALPING - BACKTEST RESULTS'):
     print(f"trades executed           : {int(executed.shape[0])} (skipped by risk limits: {skipped})")
     print(f"win rate                  : {win_rate:.1%}")
     print(f"profit factor             : {profit_factor:.2f}")
-    print(f"average R multiple        : {executed['r_multiple'].mean():.3f}")
+    r = executed['r_multiple']
+    t_stat = r.mean() / (r.std() / np.sqrt(len(r))) if len(r) > 1 else np.nan
+    print(f"average R multiple (gross): {r.mean():.4f}  (t-stat {t_stat:.2f}; |t| < ~2 is indistinguishable from zero)")
     print(f"total return              : {total_return_pct:.2f}%")
     print(f"max drawdown              : {summary['max_dd']:.2%}")
     print(f"trading days              : {days_traded}")
@@ -860,15 +1066,16 @@ def main(instrument='GBPUSD', csv_path=None):
     preset = INSTRUMENT_PRESETS[instrument]
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    if instrument.startswith('MNQ'):
+    if instrument.startswith('MNQ') or instrument == 'NQ':
         if csv_path is None:
             csv_path = os.path.join(base_dir, 'data', 'MNQ_1m_v2_clean.parquet')
-        df = pd.read_parquet(csv_path)
+        df = back_adjust_rolls(pd.read_parquet(csv_path))
 
         tr, d = signal_generation_ohlc(df, tz='America/New_York',
                                         stop_mult=preset['stop_mult'], target_mult=preset['target_mult'],
                                         session_start=preset.get('session_start'), session_end=preset.get('session_end'),
-                                        sessions=preset.get('sessions'))
+                                        sessions=preset.get('sessions'),
+                                        target_through_ticks=1, tick_size=preset['tick_size'])
 
         # gross (frictionless, like every other backtest in this repo) vs
         # net of a realistic commission+slippage estimate - see the "MNQ
@@ -885,7 +1092,7 @@ def main(instrument='GBPUSD', csv_path=None):
                                             tick_size=preset['tick_size'])
         statistics(out_net, summary_net,
                    label=f"{instrument} - NET (commission ${preset['commission_round_trip']:.2f}/contract "
-                         f"+ {preset['slippage_ticks']:.0f} ticks slippage per round trip)")
+                         f"+ {preset['slippage_ticks']:.0f} tick slippage per market fill)")
 
         # a single continuous run halts forever at the first drawdown
         # breach - see backtesting_cycles()'s docstring for why that isn't
@@ -902,7 +1109,29 @@ def main(instrument='GBPUSD', csv_path=None):
                                             slippage_ticks=preset['slippage_ticks'],
                                             tick_size=preset['tick_size'])
         summarize_cycles(cycles_net, label=f'{instrument} - REPEATED CYCLES, NET of commission/slippage')
+        zero = [pass_rate(backtesting_cycles(zero_edge_trades(tr, seed), point_value=preset['point_value'],
+                                             whole_contracts=preset['whole_contracts'])[1])[1] for seed in range(20)]
+        print(f"zero-edge baseline pass rate: {np.nanmean(zero):.1%}  (same payoff shape, average R forced to 0 -"
+              f" a pass rate is only evidence of skill if it clearly beats this)")
 
+        # futures prop firms measure drawdown in trailing DOLLARS, breached
+        # by open losses - see backtesting_futures_prop()
+        print()
+        print('=' * 60)
+        print(f'{instrument} - FUTURES PROP RULES (generic templates, net of cost, repeated cycles)')
+        print('=' * 60)
+        for name, rule in FUTURES_PROP_TEMPLATES.items():
+            risk_usd = 500.0 if rule['account'] <= 50000 else 1500.0
+            kw = dict(rule, risk_usd=risk_usd, point_value=preset['point_value'], tick_size=preset['tick_size'])
+            n_c, p_net = pass_rate(backtesting_futures_prop(tr, commission_round_trip=preset['commission_round_trip'],
+                                                            slippage_ticks=preset['slippage_ticks'], **kw))
+            p_zero = np.nanmean([pass_rate(backtesting_futures_prop(zero_edge_trades(tr, seed), **kw))[1]
+                                 for seed in range(10)])
+            print(f"{name}, ${risk_usd:,.0f}/trade: pass {p_net:.1%} of {n_c} cycles  (zero-edge baseline {p_zero:.1%})")
+
+        if not out_net['executed'].any():
+            print(f'no trades could be sized at {RISK_PCT:.1%} risk on {INITIAL_EQUITY:,.0f} - skipping plots')
+            return
         fname = instrument.lower().replace('_', ' ')
         plot(d, out_net, summary_net, title_prefix=f'Prop Firm Scalping ({instrument}, net of cost)',
              equity_path=os.path.join(base_dir, 'preview', f'prop firm scalping {fname} equity curve.png'),

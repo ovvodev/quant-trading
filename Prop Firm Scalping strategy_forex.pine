@@ -1,0 +1,226 @@
+//@version=5
+// =============================================================================
+// PROP FIRM SCALPING STRATEGY
+// =============================================================================
+// Pine Script port of "Prop Firm Scalping backtest.py" from this repository.
+// Same trading idea, adapted to Pine's non-repainting execution model:
+//   1. trade only the most liquid FX window (London/New York overlap)
+//   2. trade WITH the prevailing trend (fast EMA vs slow EMA), never against it
+//   3. enter on a short term overextension back towards the trend: price
+//      pokes outside a Bollinger Band, then snaps back inside (confirmation),
+//      i.e. buy a dip in an uptrend / sell a rip in a downtrend
+//   4. skip dead markets and abnormal volatility spikes with a CAUSAL rolling
+//      volatility percentile filter (ta.percentrank, no lookahead - the
+//      original Python research prototype used a whole-sample quantile for
+//      speed, which is not tradable live; this version fixes that)
+//   5. size stop/target off recent volatility instead of a fixed pip value
+//
+// wrapped with the money management an evaluation actually requires:
+//   - fixed fractional risk per trade
+//   - a daily loss circuit breaker (buffered inside the typical 5% limit)
+//   - a max drawdown circuit breaker (buffered inside the typical 10% limit)
+//   - a profit target lock so the system stops risking further once the
+//     evaluation target is hit instead of giving the payout back
+//   - a per day trade cap to prevent overtrading / revenge trading
+//
+// usage notes:
+//   - intended for a 1 minute chart on a liquid FX pair (e.g. FX:GBPUSD,
+//     OANDA:GBPUSD). the session/day logic assumes 1 minute bars.
+//   - default session timezone is a FIXED UTC-5 offset (matching the
+//     histdata.com convention used to build the original backtest, which
+//     does not shift for daylight saving). switch to "America/New_York" in
+//     the inputs if you want real DST-aware New York time instead.
+//   - stop/target are attached as real broker-side stop/limit orders, so
+//     TradingView's strategy tester fills them against bar high/low, which
+//     is more realistic than the close-only approximation used in the
+//     original Python prototype.
+//   - costs: slippage=3 ticks per market/stop fill (0.3 pip on a 5-digit
+//     FX feed, a stand-in for half the spread plus slippage) and
+//     backtest_fill_limits_assumption=3 (the take-profit only fills once
+//     price trades 0.3 pip through it). the old default of 0/0 made the
+//     backtest frictionless. set these to your broker's real spread.
+//   - position size is divided by syminfo.pointvalue, so the Risk % is the
+//     real dollar risk on any symbol (on spot FX pointvalue is 1 and nothing
+//     changes; loaded on a futures contract the old formula over-sized).
+//   - evidence so far: the only test of this exact configuration is one
+//     month of GBPUSD (June 2018, 63 trades, causal volatility filter):
+//     profit factor ~1.5, t-stat 1.41 - not statistically significant, and
+//     most of the profit came in the second half of the month. treat it as
+//     unproven until tested on years of data with real spreads.
+// =============================================================================
+
+strategy("Prop Firm Scalping Strategy", overlay=true,
+     initial_capital=100000,
+     default_qty_type=strategy.fixed,
+     pyramiding=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0,
+     slippage=3,
+     backtest_fill_limits_assumption=3,
+     process_orders_on_close=false)
+
+// ------------------------------------------------------------------ inputs
+grpSignal = "Signal"
+emaFastLen   = input.int(90,  "EMA Fast",              group=grpSignal)
+emaSlowLen   = input.int(300, "EMA Slow",               group=grpSignal)
+bbLen        = input.int(30,  "Bollinger Length",       group=grpSignal)
+bbMult       = input.float(1.3, "Bollinger Mult",       group=grpSignal, step=0.1)
+volLen       = input.int(60,  "Volatility Window (ATR-proxy)", group=grpSignal)
+volLookback  = input.int(500, "Volatility Percentile Lookback", group=grpSignal)
+minVolPct    = input.float(30, "Min Volatility Percentile", group=grpSignal)
+maxVolPct    = input.float(97, "Max Volatility Percentile", group=grpSignal)
+stopMult     = input.float(3.0, "Stop = x * Volatility",  group=grpSignal, step=0.1)
+targetMult   = input.float(2.0, "Target = x * Volatility", group=grpSignal, step=0.1)
+maxHoldMin   = input.int(45,  "Max Holding Minutes",    group=grpSignal)
+maxTradesDay = input.int(5,   "Max Trades Per Day",     group=grpSignal)
+
+grpSession = "Session"
+sessionInput  = input.session("0800-1200", "Trading Session", group=grpSession)
+sessionTz     = input.string("UTC-5", "Session Timezone", options=["UTC-5", "America/New_York"], group=grpSession)
+
+grpRisk = "Prop Firm Risk Management"
+riskPct       = input.float(0.5, "Risk % of Equity per Trade", group=grpRisk, step=0.05) / 100
+dailyLossPct  = input.float(2.0, "Daily Loss Limit %",  group=grpRisk, step=0.5) / 100
+maxDDPct      = input.float(8.0, "Max Drawdown Limit %", group=grpRisk, step=0.5) / 100
+profitTgtPct  = input.float(10.0, "Profit Target % (lock, stop risking further)", group=grpRisk, step=0.5) / 100
+
+// ------------------------------------------------------------- indicators
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+trendUp = emaFast > emaSlow
+trendDn = emaFast < emaSlow
+
+bbMid   = ta.sma(close, bbLen)
+bbStd   = ta.stdev(close, bbLen)
+bbUpper = bbMid + bbMult * bbStd
+bbLower = bbMid - bbMult * bbStd
+
+vol        = ta.stdev(close, volLen)
+volPctRank = ta.percentrank(vol, volLookback)
+okVol      = vol > 0 and volPctRank >= minVolPct and volPctRank <= maxVolPct
+
+plot(emaFast, "EMA Fast", color=color.new(color.blue, 0))
+plot(emaSlow, "EMA Slow", color=color.new(color.orange, 0))
+p1 = plot(bbUpper, "BB Upper", color=color.new(color.silver, 40))
+p2 = plot(bbLower, "BB Lower", color=color.new(color.silver, 40))
+fill(p1, p2, color=color.new(color.silver, 92))
+
+// --------------------------------------------------------------- session
+inSession = not na(time(timeframe.period, sessionInput, sessionTz))
+bgcolor(inSession ? color.new(color.teal, 92) : na, title="Session Highlight")
+
+// ---------------------------------------------------------- day tracking
+dayId = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
+var int lastDayId = na
+isNewDay = na(lastDayId) or dayId != lastDayId
+if isNewDay
+    lastDayId := dayId
+
+var int tradesToday = 0
+if isNewDay
+    tradesToday := 0
+
+// ---------------------------------------------------- prop firm risk state
+closedEquity = strategy.initial_capital + strategy.netprofit
+
+var float dayStartEquity = strategy.initial_capital
+var float peakEquity     = strategy.initial_capital
+var bool  dayHalted      = false
+var bool  permHalted     = false
+var bool  targetHit      = false
+
+if isNewDay
+    dayStartEquity := closedEquity
+    dayHalted := false
+
+peakEquity := math.max(peakEquity, closedEquity)
+currentDD = peakEquity > 0 ? (peakEquity - closedEquity) / peakEquity : 0.0
+dailyLoss = dayStartEquity > 0 ? (dayStartEquity - closedEquity) / dayStartEquity : 0.0
+
+if dailyLoss >= dailyLossPct
+    dayHalted := true
+if currentDD >= maxDDPct
+    permHalted := true
+if not targetHit and (closedEquity - strategy.initial_capital) / strategy.initial_capital >= profitTgtPct
+    targetHit := true
+
+canTrade = inSession and tradesToday < maxTradesDay and okVol and not dayHalted and not permHalted and not targetHit and strategy.position_size == 0
+
+// ------------------------------------------------------- pullback signal
+// state machine mirrors the Python prototype: "wasBelow"/"wasAbove" track
+// whether price already poked outside the band while flat and waiting for
+// the snap-back-inside confirmation bar.
+var bool wasBelow = false
+var bool wasAbove = false
+
+longSetup   = canTrade and trendUp and close < bbLower
+longConfirm = canTrade and trendUp and wasBelow and close >= bbLower
+if longSetup
+    wasBelow := true
+else if longConfirm
+    wasBelow := false
+else
+    wasBelow := false
+
+shortSetup   = canTrade and trendDn and close > bbUpper
+shortConfirm = canTrade and trendDn and wasAbove and close <= bbUpper
+if shortSetup
+    wasAbove := true
+else if shortConfirm
+    wasAbove := false
+else
+    wasAbove := false
+
+// ------------------------------------------------------------- position sizing
+stopDist   = stopMult * vol
+targetDist = targetMult * vol
+riskAmount = closedEquity * riskPct
+qty        = stopDist > 0 and syminfo.pointvalue > 0 ? riskAmount / (stopDist * syminfo.pointvalue) : na
+
+// ------------------------------------------------------------------ entries
+var int entryBarIndex = na
+timeframeMinutes = timeframe.in_seconds(timeframe.period) / 60
+maxHoldBars = timeframeMinutes > 0 ? math.round(maxHoldMin / timeframeMinutes) : maxHoldMin
+
+if longConfirm and not na(qty) and qty > 0
+    strategy.entry("Long", strategy.long, qty=qty)
+    strategy.exit("XL", "Long", stop=close - stopDist, limit=close + targetDist)
+    entryBarIndex := bar_index
+    tradesToday := tradesToday + 1
+
+if shortConfirm and not na(qty) and qty > 0
+    strategy.entry("Short", strategy.short, qty=qty)
+    strategy.exit("XS", "Short", stop=close + stopDist, limit=close - targetDist)
+    entryBarIndex := bar_index
+    tradesToday := tradesToday + 1
+
+// ---------------------------------------------------- time / session exits
+barsHeld = na(entryBarIndex) ? 0 : bar_index - entryBarIndex
+timeStop = strategy.position_size != 0 and barsHeld >= maxHoldBars
+sessionEndStop = strategy.position_size != 0 and not inSession
+
+if timeStop or sessionEndStop
+    strategy.close_all(comment=timeStop ? "time stop" : "session end")
+
+// ------------------------------------------------------------------ dashboard
+var table statusTable = table.new(position.top_right, 2, 8, border_width=1)
+if barstate.islast
+    table.cell(statusTable, 0, 0, "Prop Firm Status", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(statusTable, 1, 0, "", bgcolor=color.new(color.gray, 70))
+    table.cell(statusTable, 0, 1, "Equity")
+    table.cell(statusTable, 1, 1, str.tostring(closedEquity, "#,##0"))
+    table.cell(statusTable, 0, 2, "Total Return")
+    table.cell(statusTable, 1, 2, str.tostring((closedEquity - strategy.initial_capital) / strategy.initial_capital * 100, "#.##") + "%")
+    table.cell(statusTable, 0, 3, "Drawdown")
+    table.cell(statusTable, 1, 3, str.tostring(currentDD * 100, "#.##") + "%")
+    table.cell(statusTable, 0, 4, "Today's PnL")
+    table.cell(statusTable, 1, 4, str.tostring(-dailyLoss * 100, "#.##") + "%")
+    table.cell(statusTable, 0, 5, "Trades Today")
+    table.cell(statusTable, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay))
+    table.cell(statusTable, 0, 6, "Daily Halted")
+    table.cell(statusTable, 1, 6, dayHalted ? "YES" : "no", text_color=dayHalted ? color.red : color.green)
+    table.cell(statusTable, 0, 7, permHalted ? "DD LIMIT BREACHED" : (targetHit ? "TARGET LOCKED" : "Active"))
+    table.cell(statusTable, 1, 7, "", bgcolor=permHalted ? color.new(color.red, 60) : (targetHit ? color.new(color.green, 60) : na))
+
+plotshape(longConfirm, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(shortConfirm, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny)
