@@ -71,10 +71,26 @@ STOP_MULT = 3.0          # stop loss = STOP_MULT * rolling vol
 TARGET_MULT = 2.0        # take profit = TARGET_MULT * rolling vol
 MIN_VOL_PCT = 0.30       # skip the quietest 30% of volatility (nothing to scalp)
 MAX_VOL_PCT = 0.97       # skip the wildest 3% of volatility (news spikes)
-SESSION_START = 8        # est, london/new york overlap begins
-SESSION_END = 12         # est, session hard close, flatten any open trade
+SESSION_START = '08:00'  # est, london/new york overlap begins
+SESSION_END = '12:00'    # est, session hard close, flatten any open trade
 MAX_HOLD_MINUTES = 45    # time stop, a scalp that stalls is not a scalp
 MAX_TRADES_PER_DAY = 5   # trade cap to avoid overtrading
+
+# ---------------------------------------------------------------------------
+# instrument presets
+# ---------------------------------------------------------------------------
+# point_value = dollars earned per 1.0 unit of price movement per contract/
+# unit (1 for a spot fx unit, 2 for MNQ - the Micro E-mini Nasdaq-100 future,
+# whose multiplier is $2/index point). session times are the window judged
+# most liquid/tradable for the instrument. futures need whole_contracts=True
+# since you cannot buy 4.3 contracts.
+
+INSTRUMENT_PRESETS = {
+    'GBPUSD': dict(point_value=1.0, tick_size=0.0001, whole_contracts=False,
+                    session_start='08:00', session_end='12:00', tz_note='EST fixed (histdata.com convention)'),
+    'MNQ': dict(point_value=2.0, tick_size=0.25, whole_contracts=True,
+                 session_start='09:30', session_end='11:30', tz_note='America/New_York (US cash equity open)'),
+}
 
 # ---------------------------------------------------------------------------
 # prop firm evaluation parameters (buffered well inside typical rules)
@@ -128,12 +144,19 @@ def signal_generation(df, ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
     d['vol'] = d['price'].rolling(vol_win).std().bfill()
     vol_lo, vol_hi = d['vol'].quantile(min_vol_pct), d['vol'].quantile(max_vol_pct)
 
-    d['hour'] = d['date'].dt.hour
+    def _to_minutes(hhmm):
+        h, m = str(hhmm).split(':')
+        return int(h) * 60 + int(m)
+
+    session_start_min = _to_minutes(session_start)
+    session_end_min = _to_minutes(session_end)
+
+    d['minute_of_day'] = d['date'].dt.hour * 60 + d['date'].dt.minute
     d['day'] = d['date'].dt.date
-    in_session = ((d['hour'] >= session_start) & (d['hour'] < session_end)).values
+    in_session = ((d['minute_of_day'] >= session_start_min) & (d['minute_of_day'] < session_end_min)).values
 
     prices, lower, upper = d['price'].values, d['bb_lower'].values, d['bb_upper'].values
-    trend, vol, hours, days = d['trend'].values, d['vol'].values, d['hour'].values, d['day'].values
+    trend, vol, minute_of_day, days = d['trend'].values, d['vol'].values, d['minute_of_day'].values, d['day'].values
 
     trades = []
     position = 0                  # 0 flat, 1 long, -1 short
@@ -209,7 +232,7 @@ def signal_generation(df, ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
                 exit_reason = 'time'
 
             # hard flatten at the end of the liquid session
-            if exit_reason is None and not in_session[i] and hours[i] >= session_end:
+            if exit_reason is None and not in_session[i] and minute_of_day[i] >= session_end_min:
                 exit_reason = 'session_end'
 
             if exit_reason is not None:
@@ -236,7 +259,8 @@ def signal_generation(df, ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
 def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
                  daily_loss_pct=DAILY_LOSS_LIMIT_PCT,
                  max_dd_pct=MAX_DRAWDOWN_LIMIT_PCT,
-                 profit_target_pct=PROFIT_TARGET_PCT):
+                 profit_target_pct=PROFIT_TARGET_PCT,
+                 point_value=1.0, whole_contracts=False):
     """apply fixed fractional position sizing and prop firm risk limits
     to the trade list produced by signal_generation().
 
@@ -250,6 +274,11 @@ def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
                              this basically unreachable)
       - profit_target_pct : once hit, stop taking on fresh risk, lock in
                              the pass/payout instead of giving it back
+
+    point_value converts a price move into a dollar move per unit/contract
+    (1.0 for a spot fx unit, 2.0 for MNQ). whole_contracts=True floors the
+    computed size to a whole number and SKIPS the trade if that rounds to
+    zero, since futures cannot be sized fractionally the way fx units can.
     """
 
     equity = initial_equity
@@ -274,8 +303,14 @@ def backtesting(tr, initial_equity=INITIAL_EQUITY, risk_pct=RISK_PCT,
             continue
 
         risk_amount = equity * risk_pct
-        units = risk_amount / row['stop_dist']
-        trade_pnl = units * row['pnl_price']
+        units = risk_amount / (row['stop_dist'] * point_value)
+        if whole_contracts:
+            units = np.floor(units)
+            if units < 1:
+                rows.append({**row, 'executed': False, 'trade_pnl': 0.0, 'equity': equity})
+                continue
+
+        trade_pnl = units * row['pnl_price'] * point_value
         equity += trade_pnl
 
         peak_equity = max(peak_equity, equity)
@@ -402,13 +437,18 @@ def plot(d, out):
     plt.close(fig)
 
 
-def main():
+def main(instrument='GBPUSD', csv_path=None):
 
+    preset = INSTRUMENT_PRESETS[instrument]
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    df = pd.read_csv(os.path.join(base_dir, 'data', 'gbpusd.csv'))
+    if csv_path is None:
+        csv_path = os.path.join(base_dir, 'data', 'gbpusd.csv')
+    df = pd.read_csv(csv_path)
 
-    tr, d = signal_generation(df)
-    out, summary = backtesting(tr)
+    tr, d = signal_generation(df, session_start=preset['session_start'],
+                               session_end=preset['session_end'])
+    out, summary = backtesting(tr, point_value=preset['point_value'],
+                                whole_contracts=preset['whole_contracts'])
     statistics(out, summary)
     plot(d, out)
 

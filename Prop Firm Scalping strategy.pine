@@ -1,10 +1,11 @@
-//@version=5
+//@version=6
 // =============================================================================
-// PROP FIRM SCALPING STRATEGY
+// PROP FIRM SCALPING STRATEGY (v6)
 // =============================================================================
 // Pine Script port of "Prop Firm Scalping backtest.py" from this repository.
 // Same trading idea, adapted to Pine's non-repainting execution model:
-//   1. trade only the most liquid FX window (London/New York overlap)
+//   1. trade only the most liquid window for the instrument (an FX session
+//      overlap, or the US cash-equity open for index futures like MNQ)
 //   2. trade WITH the prevailing trend (fast EMA vs slow EMA), never against it
 //   3. enter on a short term overextension back towards the trend: price
 //      pokes outside a Bollinger Band, then snaps back inside (confirmation),
@@ -13,95 +14,130 @@
 //      volatility percentile filter (ta.percentrank, no lookahead - the
 //      original Python research prototype used a whole-sample quantile for
 //      speed, which is not tradable live; this version fixes that)
-//   5. size stop/target off recent volatility instead of a fixed pip value
+//   5. size stop/target off recent volatility instead of a fixed pip/point value
 //
 // wrapped with the money management an evaluation actually requires:
-//   - fixed fractional risk per trade
+//   - fixed fractional risk per trade, converted to CONTRACTS via
+//     syminfo.pointvalue so the same logic works on FX (point value 1) and
+//     on futures like MNQ (point value 2) without changing the formula
 //   - a daily loss circuit breaker (buffered inside the typical 5% limit)
 //   - a max drawdown circuit breaker (buffered inside the typical 10% limit)
 //   - a profit target lock so the system stops risking further once the
 //     evaluation target is hit instead of giving the payout back
 //   - a per day trade cap to prevent overtrading / revenge trading
 //
+// v6 changes vs the v5 port:
+//   - //@version=6, explicit type annotations on the key state variables
+//   - position sizing now goes through syminfo.pointvalue and floors to
+//     whole contracts (futures can't be sized fractionally like FX units
+//     could) via a switch-based "Instrument Preset" that also sets a
+//     sensible default trading session per asset class
+//   - a "Point Value Override" input for instruments Pine misreports, and a
+//     minimum-1-contract guard that SKIPS a trade rather than silently
+//     oversizing it when the risk % is too small for one contract
+//
 // usage notes:
-//   - intended for a 1 minute chart on a liquid FX pair (e.g. FX:GBPUSD,
-//     OANDA:GBPUSD). the session/day logic assumes 1 minute bars.
-//   - default session timezone is a FIXED UTC-5 offset (matching the
+//   - intended for a 1 minute chart. session/day-boundary logic assumes
+//     intraday bars; it still runs on other timeframes but the "minutes
+//     held" time-stop and trade-per-day cap are calibrated for 1 minute.
+//   - the FX session default uses a FIXED UTC-5 offset (matching the
 //     histdata.com convention used to build the original backtest, which
-//     does not shift for daylight saving). switch to "America/New_York" in
-//     the inputs if you want real DST-aware New York time instead.
+//     does not shift for daylight saving). switch the timezone input to
+//     "America/New_York" for real DST-aware New York time instead.
 //   - stop/target are attached as real broker-side stop/limit orders, so
 //     TradingView's strategy tester fills them against bar high/low, which
 //     is more realistic than the close-only approximation used in the
 //     original Python prototype.
 //   - this is an educational strategy. backtest results assume the
 //     commission/slippage you configure below; validate against your own
-//     broker's spread before trading a live evaluation.
+//     broker/exchange fee schedule before trading a live evaluation.
 // =============================================================================
 
-strategy("Prop Firm Scalping Strategy", overlay=true,
-     initial_capital=100000,
-     default_qty_type=strategy.fixed,
-     pyramiding=0,
-     commission_type=strategy.commission.cash_per_contract,
-     commission_value=0,
-     slippage=0,
-     process_orders_on_close=false)
+strategy("Prop Firm Scalping Strategy", overlay = true,
+     initial_capital = 100000,
+     default_qty_type = strategy.fixed,
+     pyramiding = 0,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0,
+     slippage = 0,
+     process_orders_on_close = false)
 
 // ------------------------------------------------------------------ inputs
-grpSignal = "Signal"
-emaFastLen   = input.int(90,  "EMA Fast",              group=grpSignal)
-emaSlowLen   = input.int(300, "EMA Slow",               group=grpSignal)
-bbLen        = input.int(30,  "Bollinger Length",       group=grpSignal)
-bbMult       = input.float(1.3, "Bollinger Mult",       group=grpSignal, step=0.1)
-volLen       = input.int(60,  "Volatility Window (ATR-proxy)", group=grpSignal)
-volLookback  = input.int(500, "Volatility Percentile Lookback", group=grpSignal)
-minVolPct    = input.float(30, "Min Volatility Percentile", group=grpSignal)
-maxVolPct    = input.float(97, "Max Volatility Percentile", group=grpSignal)
-stopMult     = input.float(3.0, "Stop = x * Volatility",  group=grpSignal, step=0.1)
-targetMult   = input.float(2.0, "Target = x * Volatility", group=grpSignal, step=0.1)
-maxHoldMin   = input.int(45,  "Max Holding Minutes",    group=grpSignal)
-maxTradesDay = input.int(5,   "Max Trades Per Day",     group=grpSignal)
+grpAsset = "Instrument"
+string assetPreset = input.string("MNQ / Index Futures (US open)", "Instrument Preset",
+     options = ["MNQ / Index Futures (US open)", "FX Major (London/NY overlap)", "Custom (use Session inputs below)"],
+     group = grpAsset,
+     tooltip = "Sets a sensible default trading session per asset class. Pick Custom to fully control the Session group below.")
+float pointValueOverride = input.float(0.0, "Point Value Override (0 = auto from syminfo.pointvalue)", group = grpAsset, minval = 0.0)
+bool wholeContractsOnly = input.bool(true, "Round position size down to whole contracts/units", group = grpAsset,
+     tooltip = "Keep ON for futures (MNQ, ES, ...). Safe to leave ON for FX too, it just rounds units down.")
 
-grpSession = "Session"
-sessionInput  = input.session("0800-1200", "Trading Session", group=grpSession)
-sessionTz     = input.string("UTC-5", "Session Timezone", options=["UTC-5", "America/New_York"], group=grpSession)
+grpSignal = "Signal"
+int emaFastLen   = input.int(90,  "EMA Fast",              group = grpSignal)
+int emaSlowLen   = input.int(300, "EMA Slow",               group = grpSignal)
+int bbLen        = input.int(30,  "Bollinger Length",       group = grpSignal)
+float bbMult     = input.float(1.3, "Bollinger Mult",       group = grpSignal, step = 0.1)
+int volLen       = input.int(60,  "Volatility Window (ATR-proxy)", group = grpSignal)
+int volLookback  = input.int(500, "Volatility Percentile Lookback", group = grpSignal)
+float minVolPct  = input.float(30, "Min Volatility Percentile", group = grpSignal)
+float maxVolPct  = input.float(97, "Max Volatility Percentile", group = grpSignal)
+float stopMult   = input.float(3.0, "Stop = x * Volatility",  group = grpSignal, step = 0.1)
+float targetMult = input.float(2.0, "Target = x * Volatility", group = grpSignal, step = 0.1)
+int maxHoldMin   = input.int(45,  "Max Holding Minutes",    group = grpSignal)
+int maxTradesDay = input.int(5,   "Max Trades Per Day",     group = grpSignal)
+
+grpSession = "Session (used when Instrument Preset = Custom)"
+string customSession   = input.session("0800-1200", "Trading Session", group = grpSession)
+string customSessionTz = input.string("UTC-5", "Session Timezone", options = ["UTC-5", "America/New_York", "America/Chicago", "UTC"], group = grpSession)
 
 grpRisk = "Prop Firm Risk Management"
-riskPct       = input.float(0.5, "Risk % of Equity per Trade", group=grpRisk, step=0.05) / 100
-dailyLossPct  = input.float(2.0, "Daily Loss Limit %",  group=grpRisk, step=0.5) / 100
-maxDDPct      = input.float(8.0, "Max Drawdown Limit %", group=grpRisk, step=0.5) / 100
-profitTgtPct  = input.float(10.0, "Profit Target % (lock, stop risking further)", group=grpRisk, step=0.5) / 100
+float riskPct      = input.float(0.5, "Risk % of Equity per Trade", group = grpRisk, step = 0.05) / 100
+float dailyLossPct = input.float(2.0, "Daily Loss Limit %",  group = grpRisk, step = 0.5) / 100
+float maxDDPct     = input.float(8.0, "Max Drawdown Limit %", group = grpRisk, step = 0.5) / 100
+float profitTgtPct = input.float(10.0, "Profit Target % (lock, stop risking further)", group = grpRisk, step = 0.5) / 100
+
+// ------------------------------------------------------- instrument preset
+// (kept as two single-value switches rather than one tuple-returning switch,
+// since Pine's switch branches must all resolve to the same scalar type)
+string sessionInput = switch assetPreset
+    "MNQ / Index Futures (US open)" => "0930-1130"
+    "FX Major (London/NY overlap)"  => "0800-1200"
+    => customSession
+
+string sessionTz = switch assetPreset
+    "MNQ / Index Futures (US open)" => "America/New_York"
+    "FX Major (London/NY overlap)"  => "UTC-5"
+    => customSessionTz
 
 // ------------------------------------------------------------- indicators
-emaFast = ta.ema(close, emaFastLen)
-emaSlow = ta.ema(close, emaSlowLen)
-trendUp = emaFast > emaSlow
-trendDn = emaFast < emaSlow
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+bool  trendUp = emaFast > emaSlow
+bool  trendDn = emaFast < emaSlow
 
-bbMid   = ta.sma(close, bbLen)
-bbStd   = ta.stdev(close, bbLen)
-bbUpper = bbMid + bbMult * bbStd
-bbLower = bbMid - bbMult * bbStd
+float bbMid   = ta.sma(close, bbLen)
+float bbStd   = ta.stdev(close, bbLen)
+float bbUpper = bbMid + bbMult * bbStd
+float bbLower = bbMid - bbMult * bbStd
 
-vol        = ta.stdev(close, volLen)
-volPctRank = ta.percentrank(vol, volLookback)
-okVol      = vol > 0 and volPctRank >= minVolPct and volPctRank <= maxVolPct
+float vol        = ta.stdev(close, volLen)
+float volPctRank = ta.percentrank(vol, volLookback)
+bool  okVol       = vol > 0 and volPctRank >= minVolPct and volPctRank <= maxVolPct
 
-plot(emaFast, "EMA Fast", color=color.new(color.blue, 0))
-plot(emaSlow, "EMA Slow", color=color.new(color.orange, 0))
-p1 = plot(bbUpper, "BB Upper", color=color.new(color.silver, 40))
-p2 = plot(bbLower, "BB Lower", color=color.new(color.silver, 40))
-fill(p1, p2, color=color.new(color.silver, 92))
+plot(emaFast, "EMA Fast", color = color.new(color.blue, 0))
+plot(emaSlow, "EMA Slow", color = color.new(color.orange, 0))
+p1 = plot(bbUpper, "BB Upper", color = color.new(color.silver, 40))
+p2 = plot(bbLower, "BB Lower", color = color.new(color.silver, 40))
+fill(p1, p2, color = color.new(color.silver, 92))
 
 // --------------------------------------------------------------- session
-inSession = not na(time(timeframe.period, sessionInput, sessionTz))
-bgcolor(inSession ? color.new(color.teal, 92) : na, title="Session Highlight")
+bool inSession = not na(time(timeframe.period, sessionInput, sessionTz))
+bgcolor(inSession ? color.new(color.teal, 92) : na, title = "Session Highlight")
 
 // ---------------------------------------------------------- day tracking
-dayId = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
+int dayId = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
 var int lastDayId = na
-isNewDay = na(lastDayId) or dayId != lastDayId
+bool isNewDay = na(lastDayId) or dayId != lastDayId
 if isNewDay
     lastDayId := dayId
 
@@ -110,7 +146,7 @@ if isNewDay
     tradesToday := 0
 
 // ---------------------------------------------------- prop firm risk state
-closedEquity = strategy.initial_capital + strategy.netprofit
+float closedEquity = strategy.initial_capital + strategy.netprofit
 
 var float dayStartEquity = strategy.initial_capital
 var float peakEquity     = strategy.initial_capital
@@ -123,8 +159,8 @@ if isNewDay
     dayHalted := false
 
 peakEquity := math.max(peakEquity, closedEquity)
-currentDD = peakEquity > 0 ? (peakEquity - closedEquity) / peakEquity : 0.0
-dailyLoss = dayStartEquity > 0 ? (dayStartEquity - closedEquity) / dayStartEquity : 0.0
+float currentDD = peakEquity > 0 ? (peakEquity - closedEquity) / peakEquity : 0.0
+float dailyLoss = dayStartEquity > 0 ? (dayStartEquity - closedEquity) / dayStartEquity : 0.0
 
 if dailyLoss >= dailyLossPct
     dayHalted := true
@@ -133,7 +169,7 @@ if currentDD >= maxDDPct
 if not targetHit and (closedEquity - strategy.initial_capital) / strategy.initial_capital >= profitTgtPct
     targetHit := true
 
-canTrade = inSession and tradesToday < maxTradesDay and okVol and not dayHalted and not permHalted and not targetHit and strategy.position_size == 0
+bool canTrade = inSession and tradesToday < maxTradesDay and okVol and not dayHalted and not permHalted and not targetHit and strategy.position_size == 0
 
 // ------------------------------------------------------- pullback signal
 // state machine mirrors the Python prototype: "wasBelow"/"wasAbove" track
@@ -142,8 +178,8 @@ canTrade = inSession and tradesToday < maxTradesDay and okVol and not dayHalted 
 var bool wasBelow = false
 var bool wasAbove = false
 
-longSetup   = canTrade and trendUp and close < bbLower
-longConfirm = canTrade and trendUp and wasBelow and close >= bbLower
+bool longSetup   = canTrade and trendUp and close < bbLower
+bool longConfirm = canTrade and trendUp and wasBelow and close >= bbLower
 if longSetup
     wasBelow := true
 else if longConfirm
@@ -151,8 +187,8 @@ else if longConfirm
 else
     wasBelow := false
 
-shortSetup   = canTrade and trendDn and close > bbUpper
-shortConfirm = canTrade and trendDn and wasAbove and close <= bbUpper
+bool shortSetup   = canTrade and trendDn and close > bbUpper
+bool shortConfirm = canTrade and trendDn and wasAbove and close <= bbUpper
 if shortSetup
     wasAbove := true
 else if shortConfirm
@@ -161,41 +197,59 @@ else
     wasAbove := false
 
 // ------------------------------------------------------------- position sizing
-stopDist   = stopMult * vol
-targetDist = targetMult * vol
-riskAmount = closedEquity * riskPct
-qty        = stopDist > 0 ? riskAmount / stopDist : na
+// syminfo.pointvalue is the dollar value of a 1.0 price move per contract
+// (2 for MNQ, 1 for a spot FX unit), so this formula covers both without
+// branching on asset class.
+float pointValue = pointValueOverride > 0 ? pointValueOverride : syminfo.pointvalue
+float stopDist   = stopMult * vol
+float targetDist = targetMult * vol
+float riskAmount = closedEquity * riskPct
+float rawQty     = stopDist > 0 and pointValue > 0 ? riskAmount / (stopDist * pointValue) : na
+float qty        = wholeContractsOnly and not na(rawQty) ? math.floor(rawQty) : rawQty
+bool  qtyOk      = not na(qty) and qty >= (wholeContractsOnly ? 1.0 : syminfo.mintick)
 
 // ------------------------------------------------------------------ entries
 var int entryBarIndex = na
-timeframeMinutes = timeframe.in_seconds(timeframe.period) / 60
-maxHoldBars = timeframeMinutes > 0 ? math.round(maxHoldMin / timeframeMinutes) : maxHoldMin
+float timeframeMinutes = timeframe.in_seconds(timeframe.period) / 60
+float maxHoldBars = timeframeMinutes > 0 ? math.round(maxHoldMin / timeframeMinutes) : maxHoldMin
 
-if longConfirm and not na(qty) and qty > 0
-    strategy.entry("Long", strategy.long, qty=qty)
-    strategy.exit("XL", "Long", stop=close - stopDist, limit=close + targetDist)
+if longConfirm and qtyOk
+    strategy.entry("Long", strategy.long, qty = qty)
+    strategy.exit("XL", "Long", stop = close - stopDist, limit = close + targetDist)
     entryBarIndex := bar_index
     tradesToday := tradesToday + 1
 
-if shortConfirm and not na(qty) and qty > 0
-    strategy.entry("Short", strategy.short, qty=qty)
-    strategy.exit("XS", "Short", stop=close + stopDist, limit=close - targetDist)
+if shortConfirm and qtyOk
+    strategy.entry("Short", strategy.short, qty = qty)
+    strategy.exit("XS", "Short", stop = close + stopDist, limit = close - targetDist)
     entryBarIndex := bar_index
     tradesToday := tradesToday + 1
 
 // ---------------------------------------------------- time / session exits
-barsHeld = na(entryBarIndex) ? 0 : bar_index - entryBarIndex
-timeStop = strategy.position_size != 0 and barsHeld >= maxHoldBars
-sessionEndStop = strategy.position_size != 0 and not inSession
+int barsHeld = na(entryBarIndex) ? 0 : bar_index - entryBarIndex
+bool timeStop = strategy.position_size != 0 and barsHeld >= maxHoldBars
+bool sessionEndStop = strategy.position_size != 0 and not inSession
 
 if timeStop or sessionEndStop
-    strategy.close_all(comment=timeStop ? "time stop" : "session end")
+    strategy.close_all(comment = timeStop ? "time stop" : "session end")
 
 // ------------------------------------------------------------------ dashboard
-var table statusTable = table.new(position.top_right, 2, 8, border_width=1)
+string statusLabel = switch
+    permHalted => "DD LIMIT BREACHED"
+    targetHit  => "TARGET LOCKED"
+    dayHalted  => "DAILY LIMIT HIT"
+    => "Active"
+
+color statusColor = switch
+    permHalted => color.new(color.red, 60)
+    targetHit  => color.new(color.green, 60)
+    dayHalted  => color.new(color.orange, 60)
+    => na
+
+var table statusTable = table.new(position.top_right, 2, 8, border_width = 1)
 if barstate.islast
-    table.cell(statusTable, 0, 0, "Prop Firm Status", bgcolor=color.new(color.gray, 70), text_color=color.white)
-    table.cell(statusTable, 1, 0, "", bgcolor=color.new(color.gray, 70))
+    table.cell(statusTable, 0, 0, "Prop Firm Status", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(statusTable, 1, 0, "", bgcolor = color.new(color.gray, 70))
     table.cell(statusTable, 0, 1, "Equity")
     table.cell(statusTable, 1, 1, str.tostring(closedEquity, "#,##0"))
     table.cell(statusTable, 0, 2, "Total Return")
@@ -206,10 +260,10 @@ if barstate.islast
     table.cell(statusTable, 1, 4, str.tostring(-dailyLoss * 100, "#.##") + "%")
     table.cell(statusTable, 0, 5, "Trades Today")
     table.cell(statusTable, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay))
-    table.cell(statusTable, 0, 6, "Daily Halted")
-    table.cell(statusTable, 1, 6, dayHalted ? "YES" : "no", text_color=dayHalted ? color.red : color.green)
-    table.cell(statusTable, 0, 7, permHalted ? "DD LIMIT BREACHED" : (targetHit ? "TARGET LOCKED" : "Active"))
-    table.cell(statusTable, 1, 7, "", bgcolor=permHalted ? color.new(color.red, 60) : (targetHit ? color.new(color.green, 60) : na))
+    table.cell(statusTable, 0, 6, "Contracts/Units Next")
+    table.cell(statusTable, 1, 6, qtyOk ? str.tostring(qty) : "skip (rounds to 0)")
+    table.cell(statusTable, 0, 7, statusLabel)
+    table.cell(statusTable, 1, 7, "", bgcolor = statusColor)
 
-plotshape(longConfirm, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.tiny)
-plotshape(shortConfirm, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny)
+plotshape(longConfirm, title = "Long Entry", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.tiny)
+plotshape(shortConfirm, title = "Short Entry", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)
