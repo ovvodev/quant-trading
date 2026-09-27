@@ -85,6 +85,14 @@ MAX_TRADES_PER_DAY = 5   # trade cap to avoid overtrading
 # most liquid/tradable for the instrument. futures need whole_contracts=True
 # since you cannot buy 4.3 contracts.
 
+# standard forex/futures session windows, all as "HH:MM" in America/New_York
+# local time. Asia wraps past midnight (19:00 -> 04:00 the next calendar
+# day), which signal_generation_ohlc()'s sessions= handles natively.
+SESSION_ASIA = ('19:00', '04:00')      # Tokyo
+SESSION_LONDON = ('03:00', '12:00')
+SESSION_NEWYORK = ('08:00', '17:00')
+ALL_SESSIONS = [SESSION_ASIA, SESSION_LONDON, SESSION_NEWYORK]
+
 INSTRUMENT_PRESETS = {
     'GBPUSD': dict(point_value=1.0, tick_size=0.0001, whole_contracts=False,
                     session_start='08:00', session_end='12:00', stop_mult=3.0, target_mult=2.0,
@@ -98,6 +106,13 @@ INSTRUMENT_PRESETS = {
                  session_start='09:30', session_end='16:00', stop_mult=3.0, target_mult=1.5,
                  commission_round_trip=0.70, slippage_ticks=2.0,
                  tz_note='America/New_York (full RTH - see note below on why NOT just the open)'),
+    # same signal/risk parameters as 'MNQ' above, but tradable in all three
+    # major sessions (Asia + London + New York) instead of just the RTH -
+    # see the "MNQ findings" note for how this compares.
+    'MNQ_ALL_SESSIONS': dict(point_value=2.0, tick_size=0.25, whole_contracts=True,
+                 sessions=ALL_SESSIONS, stop_mult=3.0, target_mult=1.5,
+                 commission_round_trip=0.70, slippage_ticks=2.0,
+                 tz_note='America/New_York, Asia+London+New York sessions combined'),
 }
 
 # ---------------------------------------------------------------------------
@@ -296,6 +311,7 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
                             stop_mult=STOP_MULT, target_mult=TARGET_MULT,
                             min_vol_pct=MIN_VOL_PCT, max_vol_pct=MAX_VOL_PCT,
                             session_start=SESSION_START, session_end=SESSION_END,
+                            sessions=None,
                             max_hold=MAX_HOLD_MINUTES, max_trades_day=MAX_TRADES_PER_DAY):
     """same strategy as signal_generation(), adapted for real OHLC bars
     (futures data) instead of a single mid-price series:
@@ -316,6 +332,14 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
         regime from years away.
       - day/session boundaries are computed in the instrument's own
         session timezone (tz), not the raw timestamp column's timezone.
+
+    sessions, when given, overrides session_start/session_end with a list
+    of (start, end) "HH:MM" pairs, all tz-local, and a bar is tradable if
+    it falls in ANY of them (e.g. Asia + London + New York at once). a
+    pair where start > end (like Asia's 19:00-04:00) is treated as
+    wrapping past midnight. trading-day boundaries (the daily trade cap,
+    the daily loss reset) stay anchored to the calendar date regardless -
+    only which bars count as "in session" changes.
     """
 
     d = df.copy()
@@ -346,17 +370,26 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
         h, m = str(hhmm).split(':')
         return int(h) * 60 + int(m)
 
-    session_start_min = _to_minutes(session_start)
-    session_end_min = _to_minutes(session_end)
+    windows = sessions if sessions is not None else [(session_start, session_end)]
 
     d['minute_of_day'] = d['date'].dt.hour * 60 + d['date'].dt.minute
     d['day'] = d['date'].dt.date
-    in_session = ((d['minute_of_day'] >= session_start_min) & (d['minute_of_day'] < session_end_min)).values
+
+    in_session = np.zeros(len(d), dtype=bool)
+    minute_of_day_arr = d['minute_of_day'].values
+    for start, end in windows:
+        s, e = _to_minutes(start), _to_minutes(end)
+        if s < e:
+            in_session |= (minute_of_day_arr >= s) & (minute_of_day_arr < e)
+        else:
+            # wraps past midnight, e.g. Asia session 19:00-04:00
+            in_session |= (minute_of_day_arr >= s) | (minute_of_day_arr < e)
+
     ok_vol_arr = ((d['vol'] > 0) & (d['vol_pctrank'] >= min_vol_pct) & (d['vol_pctrank'] <= max_vol_pct)).values
 
     opens, highs, lows, closes = d['open'].values, d['high'].values, d['low'].values, d['close'].values
     lower, upper, trend, vol = d['bb_lower'].values, d['bb_upper'].values, d['trend'].values, d['vol'].values
-    minute_of_day, days = d['minute_of_day'].values, d['day'].values
+    days = d['day'].values
     bb_ready = ~np.isnan(lower)
 
     trades = []
@@ -417,7 +450,7 @@ def signal_generation_ohlc(df, tz='America/New_York', ema_fast=EMA_FAST, ema_slo
 
             if exit_reason is None and (i - entry_idx) >= max_hold:
                 exit_reason, exit_price = 'time', closes[i]
-            if exit_reason is None and not in_session[i] and minute_of_day[i] >= session_end_min:
+            if exit_reason is None and not in_session[i]:
                 exit_reason, exit_price = 'session_end', closes[i]
 
             if exit_reason is not None:
@@ -827,21 +860,22 @@ def main(instrument='GBPUSD', csv_path=None):
     preset = INSTRUMENT_PRESETS[instrument]
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    if instrument == 'MNQ':
+    if instrument.startswith('MNQ'):
         if csv_path is None:
             csv_path = os.path.join(base_dir, 'data', 'MNQ_1m_v2_clean.parquet')
         df = pd.read_parquet(csv_path)
 
         tr, d = signal_generation_ohlc(df, tz='America/New_York',
                                         stop_mult=preset['stop_mult'], target_mult=preset['target_mult'],
-                                        session_start=preset['session_start'], session_end=preset['session_end'])
+                                        session_start=preset.get('session_start'), session_end=preset.get('session_end'),
+                                        sessions=preset.get('sessions'))
 
         # gross (frictionless, like every other backtest in this repo) vs
         # net of a realistic commission+slippage estimate - see the "MNQ
         # findings" note above for why this comparison is the whole point.
         out_gross, summary_gross = backtesting(tr, point_value=preset['point_value'],
                                                  whole_contracts=preset['whole_contracts'])
-        statistics(out_gross, summary_gross, label='MNQ - GROSS (frictionless, no commission/slippage)')
+        statistics(out_gross, summary_gross, label=f'{instrument} - GROSS (frictionless, no commission/slippage)')
 
         print()
         out_net, summary_net = backtesting(tr, point_value=preset['point_value'],
@@ -850,7 +884,7 @@ def main(instrument='GBPUSD', csv_path=None):
                                             slippage_ticks=preset['slippage_ticks'],
                                             tick_size=preset['tick_size'])
         statistics(out_net, summary_net,
-                   label=f"MNQ - NET (commission ${preset['commission_round_trip']:.2f}/contract "
+                   label=f"{instrument} - NET (commission ${preset['commission_round_trip']:.2f}/contract "
                          f"+ {preset['slippage_ticks']:.0f} ticks slippage per round trip)")
 
         # a single continuous run halts forever at the first drawdown
@@ -860,18 +894,19 @@ def main(instrument='GBPUSD', csv_path=None):
         print()
         _, cycles_gross = backtesting_cycles(tr, point_value=preset['point_value'],
                                               whole_contracts=preset['whole_contracts'])
-        summarize_cycles(cycles_gross, label='MNQ - REPEATED CYCLES, GROSS (frictionless)')
+        summarize_cycles(cycles_gross, label=f'{instrument} - REPEATED CYCLES, GROSS (frictionless)')
         print()
         _, cycles_net = backtesting_cycles(tr, point_value=preset['point_value'],
                                             whole_contracts=preset['whole_contracts'],
                                             commission_round_trip=preset['commission_round_trip'],
                                             slippage_ticks=preset['slippage_ticks'],
                                             tick_size=preset['tick_size'])
-        summarize_cycles(cycles_net, label='MNQ - REPEATED CYCLES, NET of commission/slippage')
+        summarize_cycles(cycles_net, label=f'{instrument} - REPEATED CYCLES, NET of commission/slippage')
 
-        plot(d, out_net, summary_net, title_prefix='Prop Firm Scalping (MNQ, net of cost)',
-             equity_path=os.path.join(base_dir, 'preview', 'prop firm scalping mnq equity curve.png'),
-             session_path=os.path.join(base_dir, 'preview', 'prop firm scalping mnq sample session.png'))
+        fname = instrument.lower().replace('_', ' ')
+        plot(d, out_net, summary_net, title_prefix=f'Prop Firm Scalping ({instrument}, net of cost)',
+             equity_path=os.path.join(base_dir, 'preview', f'prop firm scalping {fname} equity curve.png'),
+             session_path=os.path.join(base_dir, 'preview', f'prop firm scalping {fname} sample session.png'))
         return
 
     if csv_path is None:

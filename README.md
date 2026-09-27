@@ -312,6 +312,8 @@ None of this is new alpha on its own, it recombines the same pullback-with-trend
 
 The script also ships a Pine Script v6 version for TradingView, and an honest second data point: backtesting the same architecture on 5 years of real 1 minute MNQ (Micro E-mini Nasdaq-100 futures) OHLC data, with stops/targets checked against bar high/low rather than close. The FX-tuned session and parameters have no edge at all on MNQ (profit factor ~0.98). Widening the session to the full US cash session and shortening the target relative to the stop turns up a small, genuinely out-of-sample-consistent edge (~56-61% win rate, profit factor ~1.02-1.05 gross, holding up every year from 2021 to 2026) - but simulated as repeated evaluation cycles (reset after every pass or fail, rather than one continuous run that freezes at the first drawdown breach), that edge passes roughly 57% of cycles gross and only about 12% of cycles once realistic commission and slippage are included. The edge is real but too thin, at this trade frequency, to survive execution costs on this instrument. Both scripts print/plot this gross-vs-net comparison directly rather than hiding it; see the "MNQ findings" comment in the Python script for the full numbers.
 
+Both scripts also support trading Asia, London and New York independently or in any combination (the Pine version exposes this as three toggles with their own session times). Tested honestly rather than assumed: enabling all three sessions on MNQ does not improve results, it makes them worse. Asia and London carry no edge of their own for this mean-reversion-pullback signal (profit factor ~0.94-0.96 in isolation) and simply dilute the one session, New York, that has one - the repeated-cycle pass rate drops from ~57%/~12% (gross/net, New York only) to ~8%/0% (gross/net, all three combined). The toggles exist so the combination can be tested directly rather than argued about, but the evidence says trade New York alone on this instrument and signal.
+
 *Click <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20backtest.py>here</a> to be redirected to the Python backtest, or <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20strategy.pine>here</a> for the Pine Script v6 port ready to paste into TradingView.*
 
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20equity%20curve.png)
@@ -321,6 +323,10 @@ The script also ships a Pine Script v6 version for TradingView, and an honest se
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20mnq%20equity%20curve.png)
 
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20mnq%20sample%20session.png)
+
+![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20mnq%20all%20sessions%20equity%20curve.png)
+
+![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20mnq%20all%20sessions%20sample%20session.png)
 
 <br>
 

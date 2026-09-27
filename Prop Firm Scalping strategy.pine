@@ -30,8 +30,8 @@
 //   - //@version=6, explicit type annotations on the key state variables
 //   - position sizing now goes through syminfo.pointvalue and floors to
 //     whole contracts (futures can't be sized fractionally like FX units
-//     could) via a switch-based "Instrument Preset" that also sets a
-//     sensible default trading session per asset class
+//     could) via a switch-based "Instrument Preset" for stop/target
+//     multiples, decoupled from session (see the Sessions group)
 //   - a "Point Value Override" input for instruments Pine misreports, and a
 //     minimum-1-contract guard that SKIPS a trade rather than silently
 //     oversizing it when the risk % is too small for one contract
@@ -40,10 +40,11 @@
 //   - intended for a 1 minute chart. session/day-boundary logic assumes
 //     intraday bars; it still runs on other timeframes but the "minutes
 //     held" time-stop and trade-per-day cap are calibrated for 1 minute.
-//   - the FX session default uses a FIXED UTC-5 offset (matching the
-//     histdata.com convention used to build the original backtest, which
-//     does not shift for daylight saving). switch the timezone input to
-//     "America/New_York" for real DST-aware New York time instead.
+//   - the Sessions group's timezone defaults to America/New_York (real
+//     DST-aware New York time). the original FX backtest instead used a
+//     FIXED UTC-5 offset (histdata.com's convention, no daylight saving
+//     shift) - pick "UTC-5" from the Sessions Timezone dropdown to match
+//     that exactly if you're re-testing the FX version.
 //   - stop/target are attached as real broker-side stop/limit orders, so
 //     TradingView's strategy tester fills them against bar high/low, which
 //     is more realistic than the close-only approximation used in the
@@ -71,6 +72,19 @@
 // winner, and see the Python backtest's "MNQ findings" comment for the
 // full numbers and suggested next steps (fewer/larger trades, or a
 // momentum/breakout signal instead of mean-reversion pullback).
+//
+// ALL SESSIONS FINDING: the Sessions group below lets Asia, London and
+// New York be traded independently or combined, and all three default ON.
+// tested honestly on the same 5 years of MNQ data: combining all three is
+// WORSE than New York alone, not better. Asia and London individually
+// carry no edge for this mean-reversion-pullback signal (profit factor
+// ~0.94-0.96 on their own) and just dilute the thin edge New York has -
+// simulated as repeated evaluation cycles, all-sessions passes ~8% of
+// cycles gross and 0 of 22 cycles net of realistic costs, versus New York
+// alone's ~57%/~12%. the toggles are there so you can test combinations
+// yourself, but the evidence says trade New York only and leave Asia/
+// London off unless you have a reason (a different symbol, a different
+// signal) to expect otherwise.
 // =============================================================================
 
 strategy("Prop Firm Scalping Strategy", overlay = true,
@@ -84,10 +98,10 @@ strategy("Prop Firm Scalping Strategy", overlay = true,
 
 // ------------------------------------------------------------------ inputs
 grpAsset = "Instrument"
-string assetPreset = input.string("MNQ / Index Futures (full RTH)", "Instrument Preset",
-     options = ["MNQ / Index Futures (full RTH)", "FX Major (London/NY overlap)", "Custom (use Session/Signal inputs below)"],
+string assetPreset = input.string("MNQ / Index Futures", "Instrument Preset",
+     options = ["MNQ / Index Futures", "FX Major", "Custom (use Signal inputs below)"],
      group = grpAsset,
-     tooltip = "Sets the trading session AND the stop/target multiples that were actually validated per asset class (see the MNQ FINDING note up top). Pick Custom to fully control the Signal/Session groups below.")
+     tooltip = "Sets the stop/target multiples that were actually validated per asset class (see the MNQ FINDING note up top). Session is controlled separately below. Pick Custom to fully control the Signal group.")
 float pointValueOverride = input.float(0.0, "Point Value Override (0 = auto from syminfo.pointvalue)", group = grpAsset, minval = 0.0)
 bool wholeContractsOnly = input.bool(true, "Round position size down to whole contracts/units", group = grpAsset,
      tooltip = "Keep ON for futures (MNQ, ES, ...). Safe to leave ON for FX too, it just rounds units down.")
@@ -106,9 +120,18 @@ float customTargetMult = input.float(2.0, "Target = x * Volatility (used when pr
 int maxHoldMin   = input.int(45,  "Max Holding Minutes",    group = grpSignal)
 int maxTradesDay = input.int(5,   "Max Trades Per Day",     group = grpSignal)
 
-grpSession = "Session (used when Instrument Preset = Custom)"
-string customSession   = input.session("0800-1200", "Trading Session", group = grpSession)
-string customSessionTz = input.string("UTC-5", "Session Timezone", options = ["UTC-5", "America/New_York", "America/Chicago", "UTC"], group = grpSession)
+// SESSIONS - see the "ALL SESSIONS FINDING" note up top before turning
+// Asia/London on for real: on 5 years of MNQ data they carry no edge of
+// their own and dilute the one session (New York) that does. All three
+// are independently toggleable so you can test any combination yourself.
+grpSession = "Sessions"
+bool asiaOn      = input.bool(true, "Trade Asia Session", group = grpSession, inline = "asia")
+string asiaTime  = input.session("1900-0400", "", group = grpSession, inline = "asia")
+bool londonOn    = input.bool(true, "Trade London Session", group = grpSession, inline = "london")
+string londonTime = input.session("0300-1200", "", group = grpSession, inline = "london")
+bool nyOn        = input.bool(true, "Trade New York Session", group = grpSession, inline = "ny")
+string nyTime    = input.session("0800-1700", "", group = grpSession, inline = "ny")
+string sessionsTz = input.string("America/New_York", "Sessions Timezone", options = ["America/New_York", "America/Chicago", "UTC-5", "UTC"], group = grpSession)
 
 grpRisk = "Prop Firm Risk Management"
 float riskPct      = input.float(0.5, "Risk % of Equity per Trade", group = grpRisk, step = 0.05) / 100
@@ -117,26 +140,15 @@ float maxDDPct     = input.float(8.0, "Max Drawdown Limit %", group = grpRisk, s
 float profitTgtPct = input.float(10.0, "Profit Target % (lock, stop risking further)", group = grpRisk, step = 0.5) / 100
 
 // ------------------------------------------------------- instrument preset
-// (kept as single-value switches rather than one tuple-returning switch,
-// since Pine's switch branches must all resolve to the same scalar type)
-string sessionInput = switch assetPreset
-    "MNQ / Index Futures (full RTH)" => "0930-1600"
-    "FX Major (London/NY overlap)"   => "0800-1200"
-    => customSession
-
-string sessionTz = switch assetPreset
-    "MNQ / Index Futures (full RTH)" => "America/New_York"
-    "FX Major (London/NY overlap)"   => "UTC-5"
-    => customSessionTz
-
+// (stop/target only now - session is independent, see the Sessions group)
 float stopMult = switch assetPreset
-    "MNQ / Index Futures (full RTH)" => 3.0
-    "FX Major (London/NY overlap)"   => 3.0
+    "MNQ / Index Futures" => 3.0
+    "FX Major"             => 3.0
     => customStopMult
 
 float targetMult = switch assetPreset
-    "MNQ / Index Futures (full RTH)" => 1.5
-    "FX Major (London/NY overlap)"   => 2.0
+    "MNQ / Index Futures" => 1.5
+    "FX Major"             => 2.0
     => customTargetMult
 
 // ------------------------------------------------------------- indicators
@@ -161,11 +173,17 @@ p2 = plot(bbLower, "BB Lower", color = color.new(color.silver, 40))
 fill(p1, p2, color = color.new(color.silver, 92))
 
 // --------------------------------------------------------------- session
-bool inSession = not na(time(timeframe.period, sessionInput, sessionTz))
+// Pine's time(timeframe, session, timezone) natively handles a session
+// string that wraps past midnight (Asia's "1900-0400"), so no manual
+// wraparound logic is needed here the way the Python backtest needed one.
+bool inAsia   = asiaOn and not na(time(timeframe.period, asiaTime, sessionsTz))
+bool inLondon = londonOn and not na(time(timeframe.period, londonTime, sessionsTz))
+bool inNY     = nyOn and not na(time(timeframe.period, nyTime, sessionsTz))
+bool inSession = inAsia or inLondon or inNY
 bgcolor(inSession ? color.new(color.teal, 92) : na, title = "Session Highlight")
 
 // ---------------------------------------------------------- day tracking
-int dayId = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
+int dayId = year(time, sessionsTz) * 10000 + month(time, sessionsTz) * 100 + dayofmonth(time, sessionsTz)
 var int lastDayId = na
 bool isNewDay = na(lastDayId) or dayId != lastDayId
 if isNewDay
