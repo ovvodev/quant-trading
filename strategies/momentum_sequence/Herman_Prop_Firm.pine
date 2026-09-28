@@ -1,0 +1,724 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License 2.0
+// at https://mozilla.org/MPL/2.0/
+//
+// ==============================================================================
+// STRATEGY: Herman Momentum Sequence — Prop Firm Edition (MNQ 5m)
+// Pine Script v6
+// ==============================================================================
+//
+// Designed specifically for MNQ futures prop-firm evaluations and funded accounts
+// (Apex, Topstep, Lucid, MFFU, etc.).
+//
+// KEY PROP-FIRM RISK CONTROLS:
+// 1. 100% PRESERVED HERMAN ENTRY SIGNAL LOGIC (Anchor candle + N-bar monotonic sequence).
+// 2. Strict Session Control with ZERO overnight or weekend position carryover.
+// 3. Daily Realized Loss Circuit Breaker ($300 default) with automatic position flatten.
+// 4. Max Trades Per Day cap (3 default) and Max Consecutive Losses breaker (3 default).
+// 5. Dual Stop Modes: Original Structural Stop OR Fixed Points Stop (50 pts = $100 risk).
+// 6. Dynamic Non-Repainting Break-Even ratchet at +1.0R (stop never moves backward).
+// 7. Multi-TP Scaling (TP1 @ 1.0R, TP2 @ 1.5R, TP3 @ 2.5R) or Fixed 2.5R Target.
+// 8. Optional Trailing Stop Runner for TP3 portion (activation @ +2.0R).
+// 9. Post-Trade Cooldown (15 min default) to prevent chop revenge-trading.
+// 10. Real-time Prop Firm HUD Dashboard Table on chart.
+//
+// ==============================================================================
+
+//@version=6
+strategy(
+     title = "Herman Momentum Sequence [Prop-Firm Edition]",
+     shorttitle = "Herman Prop MNQ",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 50000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 1.00, // Lucid/standard MNQ round-trip commission ($0.50/side)
+     slippage = 1,            // 1 tick = 0.25 pts ($0.50) per side
+     margin_long = 5,
+     margin_short = 5,
+     calc_on_every_tick = false,
+     process_orders_on_close = false,
+     max_labels_count = 500,
+     max_lines_count = 500
+)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. INPUT GROUPS
+// ═════════════════════════════════════════════════════════════════════════════
+
+string G_CORE    = "1. Core Strategy & Direction"
+string G_STOP    = "2. Stop Loss Model"
+string G_TP      = "3. Take Profit & Exits"
+string G_BE      = "4. Break-Even Protection"
+string G_TRAIL   = "5. Optional Trailing Runner"
+string G_DAILY   = "6. Prop Firm Daily Protection"
+string G_SESSION = "7. Session & Overnight Governance"
+string G_COOL    = "8. Anti-Overtrading Cooldown"
+string G_VISUALS = "9. Visuals & HUD Table"
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. INPUT SETTINGS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// --- 1. Core & Direction ---
+followingCandles = input.int(
+     5,
+     title = "Following Candles (N)",
+     options = [2, 3, 4, 5],
+     group = G_CORE,
+     tooltip = "Original Herman sequence count. Default 5 produces the highest win-rate signal."
+)
+
+tradeContracts = input.int(
+     1,
+     title = "Position Size (MNQ Contracts)",
+     options = [1, 2, 3, 4, 5],
+     group = G_CORE,
+     tooltip = "Number of MNQ micro futures contracts to trade per entry."
+)
+
+enableLongTrades = input.bool(
+     true,
+     title = "Enable Long Trades",
+     group = G_CORE,
+     tooltip = "Long entries are enabled by default as verified by the research edge."
+)
+
+enableShortTrades = input.bool(
+     false,
+     title = "Enable Short Trades",
+     group = G_CORE,
+     tooltip = "Short entries are disabled by default. Keep disabled unless specifically hedging."
+)
+
+// --- 2. Stop Loss Model ---
+stopMode = input.string(
+     "Fixed Points Stop",
+     title = "Stop Loss Mode",
+     options = ["Original Structural Stop", "Fixed Points Stop"],
+     group = G_STOP,
+     tooltip = "Fixed Points Stop provides predictable dollar risk. Original Structural Stop anchors to the main candle extreme."
+)
+
+fixedStopPoints = input.float(
+     50.0,
+     title = "Fixed Stop Distance (Points)",
+     minval = 10.0,
+     step = 5.0,
+     group = G_STOP,
+     tooltip = "For MNQ: 50 points = $100 risk per contract ($2 per point). Recommended for $25k/$50k accounts."
+)
+
+// --- 3. Take Profit & Exits ---
+targetMode = input.string(
+     "Fixed R Target",
+     title = "Take Profit Mode",
+     options = ["Fixed R Target", "Multi-TP Prop Mode"],
+     group = G_TP,
+     tooltip = "Fixed R Target closes the entire position at a single R-multiple (research optimum is 2.5R). Multi-TP scales out in 3 tranches."
+)
+
+fixedTargetR = input.float(
+     2.5,
+     title = "Fixed Target R-Multiple",
+     minval = 0.5,
+     step = 0.5,
+     group = G_TP,
+     tooltip = "Optimal target identified in institutional backtests is 2.5R."
+)
+
+tp1R = input.float(1.0, title = "Multi-TP 1 Target (R)", step = 0.5, group = G_TP)
+tp1Pct = input.int(25, title = "Multi-TP 1 Allocation (%)", minval = 0, maxval = 100, step = 5, group = G_TP)
+
+tp2R = input.float(1.5, title = "Multi-TP 2 Target (R)", step = 0.5, group = G_TP)
+tp2Pct = input.int(25, title = "Multi-TP 2 Allocation (%)", minval = 0, maxval = 100, step = 5, group = G_TP)
+
+tp3R = input.float(2.5, title = "Multi-TP 3 Target (R)", step = 0.5, group = G_TP)
+tp3Pct = input.int(50, title = "Multi-TP 3 Allocation (%)", minval = 0, maxval = 100, step = 5, group = G_TP)
+
+// --- 4. Break-Even Protection ---
+enableBreakEven = input.bool(
+     true,
+     title = "Enable Break-Even Stop",
+     group = G_BE,
+     tooltip = "Ratchets stop to entry price once trigger R is touched. Never moves backward."
+)
+
+breakEvenTriggerR = input.float(
+     1.0,
+     title = "Break-Even Trigger (R)",
+     minval = 0.5,
+     step = 0.5,
+     group = G_BE,
+     tooltip = "When profit reaches this R-multiple, stop loss is moved to Entry Price + Offset."
+)
+
+breakEvenOffsetPts = input.float(
+     0.0,
+     title = "Break-Even Offset (Points)",
+     step = 1.0,
+     group = G_BE,
+     tooltip = "Additional points beyond entry price (e.g. +1.0 pt covers round-trip commission)."
+)
+
+// --- 5. Optional Trailing Runner ---
+enableTrailingRunner = input.bool(
+     false,
+     title = "Enable Trailing Runner on Final Leg",
+     group = G_TRAIL,
+     tooltip = "Replaces fixed TP3 with a non-loosening trailing stop once activated."
+)
+
+trailTriggerR = input.float(
+     2.0,
+     title = "Trailing Activation (R)",
+     minval = 1.0,
+     step = 0.5,
+     group = G_TRAIL,
+     tooltip = "Profit level required before the trailing stop activates."
+)
+
+trailMethod = input.string(
+     "Fixed Points",
+     title = "Trailing Method",
+     options = ["Fixed Points", "ATR Based", "Candle Structure"],
+     group = G_TRAIL
+)
+
+trailFixedPts = input.float(30.0, title = "Fixed Trailing Distance (Points)", minval = 5.0, step = 5.0, group = G_TRAIL)
+trailAtrLen   = input.int(14, title = "ATR Length", minval = 1, group = G_TRAIL)
+trailAtrMult  = input.float(2.0, title = "ATR Multiplier", minval = 0.5, step = 0.5, group = G_TRAIL)
+
+// --- 6. Prop Firm Daily Protection ---
+enableDailyLoss = input.bool(
+     true,
+     title = "Enable Daily Realized Loss Limit",
+     group = G_DAILY,
+     tooltip = "Halts trading and closes open positions when daily closed loss reaches this limit."
+)
+
+dailyLossLimit = input.float(
+     300.0,
+     title = "Daily Loss Limit ($)",
+     minval = 50.0,
+     step = 25.0,
+     group = G_DAILY,
+     tooltip = "Maximum allowed cumulative realized loss per New York trading day."
+)
+
+maxTradesPerDay = input.int(
+     3,
+     title = "Maximum Trades Per Day",
+     minval = 1,
+     maxval = 20,
+     group = G_DAILY,
+     tooltip = "Prevents overtrading. Trading halts after this many completed entries in a day."
+)
+
+enableConsecLoss = input.bool(
+     true,
+     title = "Enable Consecutive Loss Breaker",
+     group = G_DAILY,
+     tooltip = "Halts trading for the day after consecutive losing trades occur."
+)
+
+maxConsecLosses = input.int(
+     3,
+     title = "Max Consecutive Losses",
+     minval = 1,
+     maxval = 10,
+     group = G_DAILY,
+     tooltip = "Trading halts for the day when this many consecutive losses occur. Break-even trades do not count as losses."
+)
+
+// --- 7. Session & Overnight Governance ---
+sessionPreset = input.string(
+     "NY AM",
+     title = "Session Preset",
+     options = ["NY AM", "NY PM", "All Sessions", "Custom Session"],
+     group = G_SESSION,
+     tooltip = "Restricts trading strictly to active liquidity hours. Never holds overnight."
+)
+
+customSessionStr = input.session(
+     "0930-1130:23456",
+     title = "Custom Session (if selected)",
+     group = G_SESSION,
+     tooltip = "Format: HHMM-HHMM:Days (New York time)."
+)
+
+closeBeforeMins = input.int(
+     0,
+     title = "Close X Mins Before Session End",
+     minval = 0,
+     maxval = 60,
+     group = G_SESSION,
+     tooltip = "Flattens positions earlier to guarantee no end-of-session volatility spikes."
+)
+
+// --- 8. Anti-Overtrading Cooldown ---
+enableCooldown = input.bool(
+     true,
+     title = "Enable Post-Trade Cooldown",
+     group = G_COOL,
+     tooltip = "Enforces a mandatory quiet period after a trade closes before another entry can trigger."
+)
+
+cooldownMinutes = input.int(
+     15,
+     title = "Cooldown Duration (Minutes)",
+     minval = 1,
+     step = 5,
+     group = G_COOL,
+     tooltip = "Minimum minutes to wait after exiting a trade before taking another setup."
+)
+
+// --- 9. Visuals & HUD Table ---
+showSignals      = input.bool(true, "Show Signal Triangles", group = G_VISUALS)
+showLevels       = input.bool(true, "Show Active Stop / Target Lines", group = G_VISUALS)
+showTable        = input.bool(true, "Show Prop Firm HUD Table", group = G_VISUALS)
+tablePos         = input.string(position.top_right, "HUD Table Position", options = [position.top_right, position.bottom_right, position.top_left, position.bottom_left], group = G_VISUALS)
+tableTheme       = input.string("Dark", "HUD Theme", options = ["Dark", "Light"], group = G_VISUALS)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. TIMEZONE & SESSION ENGINE
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Active trading session string in New York timezone
+string activeSession = switch sessionPreset
+    "NY AM"          => "0930-1200:23456"
+    "NY PM"          => "1330-1600:23456"
+    "All Sessions"   => "0930-1600:23456"
+    "Custom Session" => customSessionStr
+    => "0930-1200:23456"
+
+// Evaluate session window strictly in America/New_York
+bool inSession = not na(time(timeframe.period, activeSession, "America/New_York"))
+
+// Day rollover detection in New York time (tracks futures trading day boundary)
+bool isNewDay = ta.change(time("D", "America/New_York")) != 0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. DAILY RISK & CIRCUIT BREAKER ENGINE
+// ═════════════════════════════════════════════════════════════════════════════
+
+var float dayStartNetProfit = 0.0
+var int   dailyTradesCount  = 0
+var int   consecLossCount   = 0
+var bool  dailyLossHalted   = false
+var bool  consecLossHalted  = false
+var int   lastExitTime      = 0
+
+// Reset daily counters on new NY trading day
+if isNewDay
+    dayStartNetProfit := strategy.netprofit
+    dailyTradesCount  := 0
+    consecLossCount   := 0
+    dailyLossHalted   := false
+    consecLossHalted  := false
+
+// Realized P&L today
+float dailyRealizedPnL = strategy.netprofit - dayStartNetProfit
+
+// Track closed trades to update trade count, cooldown, and consecutive loss tracking
+if ta.change(strategy.closedtrades) > 0
+    dailyTradesCount += 1
+    lastExitTime := time
+    
+    // Check realized profit of the trade that just closed
+    float lastTradeProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    
+    // Break-even trades (within +/- $2.00) do NOT count as a loss
+    if lastTradeProfit < -2.00
+        consecLossCount += 1
+    else if lastTradeProfit > 2.00
+        consecLossCount := 0
+
+// Daily loss circuit breaker trigger
+if enableDailyLoss and not dailyLossHalted
+    if dailyRealizedPnL <= -dailyLossLimit
+        dailyLossHalted := true
+        strategy.close_all(comment = "Daily Loss Breached")
+        strategy.cancel_all()
+
+// Consecutive loss circuit breaker trigger
+if enableConsecLoss and not consecLossHalted
+    if consecLossCount >= maxConsecLosses
+        consecLossHalted := true
+        strategy.close_all(comment = "Consecutive Loss Halt")
+        strategy.cancel_all()
+
+// Post-trade cooldown calculation
+bool isCooldownActive = enableCooldown and (time - lastExitTime) < (cooldownMinutes * 60 * 1000)
+
+// Max trades per day check
+bool maxTradesReached = dailyTradesCount >= maxTradesPerDay
+
+// Master trading eligibility guard
+bool tradingAllowed = inSession and 
+                      not dailyLossHalted and 
+                      not consecLossHalted and 
+                      not maxTradesReached and 
+                      not isCooldownActive
+
+// Hard Session End Flattening: Zero Overnight Positions
+// When session ends, cancel all pending orders and immediately close open positions
+if not inSession
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all(comment = "Session End Flatten")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. HERMAN ENTRY SIGNAL ENGINE (100% UNCHANGED ORIGINAL LOGIC)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Anchor candle polarity at lookback offset
+mainBearish = close[followingCandles] < open[followingCandles]
+mainBullish = close[followingCandles] > open[followingCandles]
+
+// Bullish sequence verification: N consecutive green candles, lows above anchor low, rising closes
+bool validBullishSequence = true
+for i = 0 to followingCandles - 1
+    if close[i] <= open[i]
+        validBullishSequence := false
+    if low[i] <= low[followingCandles]
+        validBullishSequence := false
+    if i < followingCandles - 1
+        if close[i] <= close[i + 1]
+            validBullishSequence := false
+
+// Bearish sequence verification: N consecutive red candles, highs below anchor high, falling closes
+bool validBearishSequence = true
+for i = 0 to followingCandles - 1
+    if close[i] >= open[i]
+        validBearishSequence := false
+    if high[i] >= high[followingCandles]
+        validBearishSequence := false
+    if i < followingCandles - 1
+        if close[i] >= close[i + 1]
+            validBearishSequence := false
+
+// Master setups
+longSetup  = mainBearish and validBullishSequence
+shortSetup = mainBullish and validBearishSequence
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. POSITION & EXIT STATE MANAGEMENT
+// ═════════════════════════════════════════════════════════════════════════════
+
+var float entryPriceRef   = na
+var float initialStopRef  = na
+var float initialRiskRef  = na
+var float currentStopRef  = na
+var float tp1Ref          = na
+var float tp2Ref          = na
+var float tp3Ref          = na
+var bool  beTriggered     = false
+var bool  trailTriggered  = false
+var float runnerStopRef   = na
+
+// ATR for optional ATR trailing runner
+atrVal = ta.atr(trailAtrLen)
+
+// Reset state when flat
+if strategy.position_size == 0
+    entryPriceRef   := na
+    initialStopRef  := na
+    initialRiskRef  := na
+    currentStopRef  := na
+    tp1Ref          := na
+    tp2Ref          := na
+    tp3Ref          := na
+    beTriggered     := false
+    trailTriggered  := false
+    runnerStopRef   := na
+
+// LONG ENTRY LOGIC
+if enableLongTrades and longSetup and tradingAllowed and strategy.position_size == 0
+    float rawStop = na
+    if stopMode == "Fixed Points Stop"
+        rawStop := close - fixedStopPoints
+    else
+        rawStop := low[followingCandles]
+    
+    // Safety guard: ensure minimum risk of 5 points (20 ticks)
+    float risk = math.max(close - rawStop, 5.0)
+    rawStop := close - risk
+    
+    // Setup target prices
+    float target1 = close + (risk * tp1R)
+    float target2 = close + (risk * tp2R)
+    float target3 = targetMode == "Fixed R Target" ? close + (risk * fixedTargetR) : close + (risk * tp3R)
+    
+    // Store reference variables
+    entryPriceRef   := close
+    initialStopRef  := rawStop
+    initialRiskRef  := risk
+    currentStopRef  := rawStop
+    tp1Ref          := target1
+    tp2Ref          := target2
+    tp3Ref          := target3
+    beTriggered     := false
+    trailTriggered  := false
+    runnerStopRef   := rawStop
+    
+    strategy.entry("Long", strategy.long, qty = tradeContracts)
+
+// SHORT ENTRY LOGIC
+if enableShortTrades and shortSetup and tradingAllowed and strategy.position_size == 0
+    float rawStop = na
+    if stopMode == "Fixed Points Stop"
+        rawStop := close + fixedStopPoints
+    else
+        rawStop := high[followingCandles]
+    
+    float risk = math.max(rawStop - close, 5.0)
+    rawStop := close + risk
+    
+    float target1 = close - (risk * tp1R)
+    float target2 = close - (risk * tp2R)
+    float target3 = targetMode == "Fixed R Target" ? close - (risk * fixedTargetR) : close - (risk * tp3R)
+    
+    entryPriceRef   := close
+    initialStopRef  := rawStop
+    initialRiskRef  := risk
+    currentStopRef  := rawStop
+    tp1Ref          := target1
+    tp2Ref          := target2
+    tp3Ref          := target3
+    beTriggered     := false
+    trailTriggered  := false
+    runnerStopRef   := rawStop
+    
+    strategy.entry("Short", strategy.short, qty = tradeContracts)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. INTRADAY TRADE MANAGEMENT (BREAK-EVEN & TRAILING STOP)
+// ═════════════════════════════════════════════════════════════════════════════
+
+if strategy.position_size > 0
+    // Long Trade Management
+    float avgEntry = strategy.opentrades.entry_price(0)
+    float rDistance = initialRiskRef
+    
+    // 1. Break-Even Trigger Check (+1.0R)
+    if enableBreakEven and not beTriggered
+        if high >= avgEntry + (rDistance * breakEvenTriggerR)
+            beTriggered := true
+    
+    if beTriggered
+        float beStopPrice = avgEntry + breakEvenOffsetPts
+        if beStopPrice > currentStopRef
+            currentStopRef := beStopPrice
+    
+    // 2. Trailing Runner Trigger Check (+2.0R)
+    if enableTrailingRunner
+        if high >= avgEntry + (rDistance * trailTriggerR)
+            trailTriggered := true
+        
+        if trailTriggered
+            float proposedStop = na
+            if trailMethod == "Fixed Points"
+                proposedStop := high - trailFixedPts
+            else if trailMethod == "ATR Based"
+                proposedStop := close - (atrVal * trailAtrMult)
+            else if trailMethod == "Candle Structure"
+                proposedStop := low[1]
+            
+            // Ratchet trailing stop upward only (never loosen)
+            if not na(proposedStop) and proposedStop > currentStopRef
+                currentStopRef := proposedStop
+
+    // 3. Submit/Update Long Exits
+    // Quantity distribution calculation for multi-contracts
+    if targetMode == "Multi-TP Prop Mode" and tradeContracts > 1
+        int q1 = math.max(1, math.round(tradeContracts * (tp1Pct / 100.0)))
+        int q2 = math.max(1, math.round(tradeContracts * (tp2Pct / 100.0)))
+        int q3 = math.max(1, tradeContracts - q1 - q2)
+        
+        strategy.exit("LX1", from_entry = "Long", qty = q1, limit = tp1Ref, stop = currentStopRef)
+        strategy.exit("LX2", from_entry = "Long", qty = q2, limit = tp2Ref, stop = currentStopRef)
+        strategy.exit("LX3", from_entry = "Long", qty = q3, limit = enableTrailingRunner ? na : tp3Ref, stop = currentStopRef)
+    else
+        // Single contract or Fixed R Mode
+        strategy.exit("LX", from_entry = "Long", qty = tradeContracts, limit = enableTrailingRunner ? na : tp3Ref, stop = currentStopRef)
+
+else if strategy.position_size < 0
+    // Short Trade Management
+    float avgEntry = strategy.opentrades.entry_price(0)
+    float rDistance = initialRiskRef
+    
+    // 1. Break-Even Trigger Check (+1.0R)
+    if enableBreakEven and not beTriggered
+        if low <= avgEntry - (rDistance * breakEvenTriggerR)
+            beTriggered := true
+    
+    if beTriggered
+        float beStopPrice = avgEntry - breakEvenOffsetPts
+        if beStopPrice < currentStopRef
+            currentStopRef := beStopPrice
+    
+    // 2. Trailing Runner Trigger Check (+2.0R)
+    if enableTrailingRunner
+        if low <= avgEntry - (rDistance * trailTriggerR)
+            trailTriggered := true
+        
+        if trailTriggered
+            float proposedStop = na
+            if trailMethod == "Fixed Points"
+                proposedStop := low + trailFixedPts
+            else if trailMethod == "ATR Based"
+                proposedStop := close + (atrVal * trailAtrMult)
+            else if trailMethod == "Candle Structure"
+                proposedStop := high[1]
+            
+            // Ratchet trailing stop downward only (never loosen)
+            if not na(proposedStop) and proposedStop < currentStopRef
+                currentStopRef := proposedStop
+
+    // 3. Submit/Update Short Exits
+    if targetMode == "Multi-TP Prop Mode" and tradeContracts > 1
+        int q1 = math.max(1, math.round(tradeContracts * (tp1Pct / 100.0)))
+        int q2 = math.max(1, math.round(tradeContracts * (tp2Pct / 100.0)))
+        int q3 = math.max(1, tradeContracts - q1 - q2)
+        
+        strategy.exit("SX1", from_entry = "Short", qty = q1, limit = tp1Ref, stop = currentStopRef)
+        strategy.exit("SX2", from_entry = "Short", qty = q2, limit = tp2Ref, stop = currentStopRef)
+        strategy.exit("SX3", from_entry = "Short", qty = q3, limit = enableTrailingRunner ? na : tp3Ref, stop = currentStopRef)
+    else
+        strategy.exit("SX", from_entry = "Short", qty = tradeContracts, limit = enableTrailingRunner ? na : tp3Ref, stop = currentStopRef)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. VISUAL CHART PLOTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Signal Markers
+plotshape(
+     showSignals and enableLongTrades and longSetup and tradingAllowed and strategy.position_size == 0,
+     title = "Herman Long Signal",
+     location = location.belowbar,
+     color = color.green,
+     style = shape.triangleup,
+     size = size.small,
+     text = "HERMAN LONG"
+)
+
+plotshape(
+     showSignals and enableShortTrades and shortSetup and tradingAllowed and strategy.position_size == 0,
+     title = "Herman Short Signal",
+     location = location.abovebar,
+     color = color.red,
+     style = shape.triangledown,
+     size = size.small,
+     text = "HERMAN SHORT"
+)
+
+// Active Stop Loss Line
+plot(
+     showLevels and strategy.position_size != 0 ? currentStopRef : na,
+     title = "Active Stop Loss",
+     color = beTriggered ? color.yellow : color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+// Active Take Profit Line (Primary or TP3)
+plot(
+     showLevels and strategy.position_size != 0 and not enableTrailingRunner ? tp3Ref : na,
+     title = "Take Profit Target",
+     color = color.green,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+// Session background highlighting
+bgcolor(inSession ? color.new(color.blue, 96) : na, title = "Trading Session Background")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. PROP FIRM HUD DASHBOARD TABLE
+// ═════════════════════════════════════════════════════════════════════════════
+
+var table hud = table.new(tablePos, 2, 10, border_width = 1)
+
+if barstate.islast and showTable
+    color c_bg   = tableTheme == "Dark" ? #1e222d : #f0f3f6
+    color c_txt  = tableTheme == "Dark" ? #d1d4dc : #131722
+    color c_head = tableTheme == "Dark" ? #2a2e39 : #e0e3eb
+    color c_pos  = #26a69a
+    color c_neg  = #ef5350
+    color c_warn = #ff9800
+    
+    table.clear(hud, 0, 0, 1, 9)
+    
+    // Row 0: Title
+    table.cell(hud, 0, 0, "HERMAN PROP FIRM", bgcolor = c_head, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 0, "MNQ 5M", bgcolor = c_head, text_color = c_pos, text_size = size.small)
+    
+    // Row 1: Session Status
+    string sessTxt = inSession ? "OPEN (" + sessionPreset + ")" : "CLOSED"
+    color sessCol  = inSession ? c_pos : c_neg
+    table.cell(hud, 0, 1, "Session Status", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 1, sessTxt, bgcolor = c_bg, text_color = sessCol, text_size = size.small)
+    
+    // Row 2: Trades Today
+    string tradesTxt = str.tostring(dailyTradesCount) + " / " + str.tostring(maxTradesPerDay)
+    color tradesCol  = maxTradesReached ? c_warn : c_txt
+    table.cell(hud, 0, 2, "Trades Today", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 2, tradesTxt, bgcolor = c_bg, text_color = tradesCol, text_size = size.small)
+    
+    // Row 3: Daily Realized P&L
+    string pnlTxt = (dailyRealizedPnL >= 0 ? "+$" : "-$") + str.tostring(math.abs(dailyRealizedPnL), "#.##")
+    color pnlCol  = dailyRealizedPnL >= 0 ? c_pos : c_neg
+    table.cell(hud, 0, 3, "Daily Realized P&L", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 3, pnlTxt, bgcolor = c_bg, text_color = pnlCol, text_size = size.small)
+    
+    // Row 4: Daily Loss Limit
+    table.cell(hud, 0, 4, "Daily Loss Limit", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 4, "-$" + str.tostring(dailyLossLimit, "#.##"), bgcolor = c_bg, text_color = c_neg, text_size = size.small)
+    
+    // Row 5: Consecutive Losses
+    string clTxt = str.tostring(consecLossCount) + " / " + str.tostring(maxConsecLosses)
+    color clCol  = consecLossHalted ? c_neg : (consecLossCount > 0 ? c_warn : c_txt)
+    table.cell(hud, 0, 5, "Consecutive Losses", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 5, clTxt, bgcolor = c_bg, text_color = clCol, text_size = size.small)
+    
+    // Row 6: Trading Status
+    string statusTxt = "READY / ACTIVE"
+    color statusCol  = c_pos
+    if dailyLossHalted
+        statusTxt := "DAILY LOSS LIMIT ACTIVE"
+        statusCol := c_neg
+    else if consecLossHalted
+        statusTxt := "CONSEC LOSS HALTED"
+        statusCol := c_neg
+    else if maxTradesReached
+        statusTxt := "MAX TRADES HALTED"
+        statusCol := c_warn
+    else if isCooldownActive
+        statusTxt := "COOLDOWN PAUSE"
+        statusCol := c_warn
+    else if not inSession
+        statusTxt := "OUTSIDE SESSION"
+        statusCol := c_txt
+    
+    table.cell(hud, 0, 6, "Strategy Status", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 6, statusTxt, bgcolor = c_bg, text_color = statusCol, text_size = size.small)
+    
+    // Row 7: Risk Per Contract
+    float estRisk = stopMode == "Fixed Points Stop" ? fixedStopPoints * 2.0 * tradeContracts : (na(initialRiskRef) ? 0.0 : initialRiskRef * 2.0 * tradeContracts)
+    table.cell(hud, 0, 7, "Risk / Trade (" + str.tostring(tradeContracts) + "ct)", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 7, "$" + str.tostring(estRisk, "#.##"), bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    
+    // Row 8: Break-Even Status
+    string beTxt = strategy.position_size == 0 ? "ARMED" : (beTriggered ? "ACTIVE (+1.0R)" : "PENDING")
+    color beCol  = beTriggered ? c_pos : c_txt
+    table.cell(hud, 0, 8, "Break-Even State", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 8, beTxt, bgcolor = c_bg, text_color = beCol, text_size = size.small)
+    
+    // Row 9: Trailing Runner Status
+    string trTxt = not enableTrailingRunner ? "DISABLED" : (strategy.position_size == 0 ? "ARMED" : (trailTriggered ? "TRAILING" : "PENDING"))
+    color trCol  = trailTriggered ? c_pos : c_txt
+    table.cell(hud, 0, 9, "Trailing Runner", bgcolor = c_bg, text_color = c_txt, text_size = size.small)
+    table.cell(hud, 1, 9, trTxt, bgcolor = c_bg, text_color = trCol, text_size = size.small)

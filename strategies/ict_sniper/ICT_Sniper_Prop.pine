@@ -1,0 +1,265 @@
+//@version=6
+strategy("ICT Sniper Prop Firm Scalper - Refined", overlay=true, initial_capital=50000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=4, margin_long=5, margin_short=5, calc_on_every_tick=false, process_orders_on_close=false, max_labels_count=500)
+
+// ==============================================================================
+// 1. INPUTS 
+// ==============================================================================
+grp_pivots = "Pivot Settings"
+pivotLeft  = input.int(10, "Pivot Left Length", group=grp_pivots)
+pivotRight = input.int(2, "Pivot Right Length", group=grp_pivots)
+
+grp_logic = "Signal Logic"
+maxSweepBars = input.int(15, "Max Bars from Pivot to Sweep", group=grp_logic)
+maxCisdBars  = input.int(20, "Max Bars from Sweep to CISD", group=grp_logic)
+minFvgPts    = input.float(2.0, "Minimum FVG Size (Points)", group=grp_logic)
+fvgOffsetPts = input.float(0.5, "FVG Front-Run Offset (Pts)", group=grp_logic)
+
+grp_time = "Time Profiling (EST Killzones)"
+useNyAm   = input.bool(true, "NY AM Session", inline="nyam", group=grp_time)
+nyAmTime  = input.session("0930-1100", "", inline="nyam", group=grp_time)
+
+useNyPm   = input.bool(true, "NY PM / Silver Bullet", inline="nypm", group=grp_time)
+nyPmTime  = input.session("1330-1600", "", inline="nypm", group=grp_time)
+
+useLondon = input.bool(false, "London Killzone", inline="lon", group=grp_time)
+lonTime   = input.session("0200-0500", "", inline="lon", group=grp_time)
+
+useAsia   = input.bool(false, "Asian Killzone", inline="asia", group=grp_time)
+asiaTime  = input.session("2000-2200", "", inline="asia", group=grp_time)
+
+grp_risk = "Risk & Daily Limits (Prop Firm)"
+qty          = input.int(4, "Contract Qty (MNQ)", group=grp_risk)
+dailyLoss    = input.float(200.0, "Daily Loss Limit ($)", group=grp_risk)
+dailyProfit  = input.float(350.0, "Daily Profit Target ($)", group=grp_risk)
+
+
+// ==============================================================================
+// 2. DAILY EQUITY LIMITS & TIME PROFILING
+// ==============================================================================
+// Native risk management - dynamically flattens trades the exact tick loss limit is breached
+strategy.risk.max_intraday_loss(dailyLoss, strategy.cash)
+
+// Correct day rollover for futures (Tracks New York session change, not calendar midnight)
+var float startOfDayEq = 0.0
+if ta.change(time("D", "America/New_York")) != 0
+    startOfDayEq := strategy.netprofit
+
+float currentDailyPnL = (strategy.netprofit + strategy.openprofit) - startOfDayEq
+bool profitHalted = currentDailyPnL >= dailyProfit
+
+// Force flatten all open positions if the profit target is hit
+if profitHalted
+    strategy.close_all(comment="Target Hit")
+
+// Evaluate Killzone Toggles 
+bool inNyAm   = useNyAm   and not na(time(timeframe.period, nyAmTime, "America/New_York"))
+bool inNyPm   = useNyPm   and not na(time(timeframe.period, nyPmTime, "America/New_York"))
+bool inLondon = useLondon and not na(time(timeframe.period, lonTime, "America/New_York"))
+bool inAsia   = useAsia   and not na(time(timeframe.period, asiaTime, "America/New_York"))
+
+// Master window boolean for Section 5 execution logic
+bool inWindow = inNyAm or inNyPm or inLondon or inAsia
+
+// PURGE STALE ORDERS: If a killzone ends or target is hit, cancel pending limit orders
+// Also force-close any open positions at session end to prevent unprotected overnight holds
+if not inWindow or profitHalted
+    strategy.cancel_all()
+    if strategy.opentrades > 0
+        strategy.close_all(comment="Session End")
+
+
+// ==============================================================================
+// 3. PIVOT DETECTION
+// ==============================================================================
+float pivotLow = ta.pivotlow(low, pivotLeft, pivotRight)
+float pivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+
+var float lastSwingLow = na
+var int lastSwingLowIdx = na
+var float lastSwingHigh = na
+var int lastSwingHighIdx = na
+
+if not na(pivotLow)
+    lastSwingLow := pivotLow
+    lastSwingLowIdx := bar_index - pivotRight
+
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+    lastSwingHighIdx := bar_index - pivotRight
+
+
+// ==============================================================================
+// 4. STATE MACHINE (Sweep -> CISD -> FVG)
+// ==============================================================================
+var int state = 0
+var float sweepExtreme = na
+var int sweepStartIdx = na
+
+// A. Check for sweeps
+if state == 0
+    if not na(lastSwingLow) and (bar_index - lastSwingLowIdx) <= maxSweepBars
+        if low < lastSwingLow and close >= lastSwingLow
+            state := 1
+            sweepExtreme := low
+            sweepStartIdx := bar_index
+    
+    if not na(lastSwingHigh) and (bar_index - lastSwingHighIdx) <= maxSweepBars
+        if high > lastSwingHigh and close <= lastSwingHigh
+            state := -1
+            sweepExtreme := high
+            sweepStartIdx := bar_index
+
+// B. Wait for Bullish CISD + FVG
+bool bullSignal = false
+float bullEntry = na
+float bullSl = na
+
+if state == 1
+    if (bar_index - sweepStartIdx) > maxCisdBars
+        state := 0
+    else if low < sweepExtreme
+        sweepExtreme := low
+        sweepStartIdx := bar_index
+    else
+        float lastDownCloseHigh = na
+        for i = 1 to maxSweepBars
+            if bar_index - i < sweepStartIdx - maxSweepBars
+                break
+            if close[i] < open[i]
+                lastDownCloseHigh := high[i]
+                break
+        
+        if not na(lastDownCloseHigh) and close > lastDownCloseHigh
+            bool hasFvg = false
+            float fvgTop = na
+            float fvgBtm = na
+            
+            if low > high[2]
+                hasFvg := true
+                fvgTop := low
+                fvgBtm := high[2]
+            else if low[1] > high[3]
+                hasFvg := true
+                fvgTop := low[1]
+                fvgBtm := high[3]
+                
+            if hasFvg and (fvgTop - fvgBtm) >= minFvgPts
+                bullSignal := true
+                bullEntry := fvgTop + fvgOffsetPts 
+                bullSl := sweepExtreme - 1.0
+                state := 0 
+
+// C. Wait for Bearish CISD + FVG
+bool bearSignal = false
+float bearEntry = na
+float bearSl = na
+
+if state == -1
+    if (bar_index - sweepStartIdx) > maxCisdBars
+        state := 0
+    else if high > sweepExtreme
+        sweepExtreme := high
+        sweepStartIdx := bar_index
+    else
+        float lastUpCloseLow = na
+        for i = 1 to maxSweepBars
+            if bar_index - i < sweepStartIdx - maxSweepBars
+                break
+            if close[i] > open[i]
+                lastUpCloseLow := low[i]
+                break
+        
+        if not na(lastUpCloseLow) and close < lastUpCloseLow
+            bool hasFvg = false
+            float fvgTop = na
+            float fvgBtm = na
+            
+            if high < low[2]
+                hasFvg := true
+                fvgTop := low[2]
+                fvgBtm := high
+            else if high[1] < low[3]
+                hasFvg := true
+                fvgTop := low[3]
+                fvgBtm := high[1]
+                
+            if hasFvg and (fvgTop - fvgBtm) >= minFvgPts
+                bearSignal := true
+                bearEntry := fvgBtm - fvgOffsetPts 
+                bearSl := sweepExtreme + 1.0
+                state := 0 
+
+
+// ==============================================================================
+// 5. EXECUTION & RISK MANAGEMENT
+// ==============================================================================
+// FIX: Dynamic max risk based on remaining daily budget, not full dailyLoss
+float remainingBudget = dailyLoss + currentDailyPnL // e.g. $200 - $100 already lost = $100 left
+float maxRiskPts = math.max(remainingBudget / (qty * 2.0), 5.0)
+
+if bullSignal and inWindow and not profitHalted and strategy.opentrades == 0
+    float risk = bullEntry - bullSl
+    if risk < 5.0
+        risk := 5.0
+    if risk > maxRiskPts
+        risk := maxRiskPts
+        bullSl := bullEntry - risk // FIXED: dynamically adjust the physical stop loss
+        
+    float tp1 = bullEntry + risk
+    float tp2 = bullEntry + (2 * risk)
+    float tp3 = bullEntry + (3 * risk)
+    
+    strategy.entry("Long", strategy.long, qty=qty, limit=bullEntry)
+    // FIX: Unique direction-prefixed IDs prevent TP label collision with Short exits
+    strategy.exit("LX1", "Long", qty=1, limit=tp1, stop=bullSl)
+    strategy.exit("LX2", "Long", qty=1, limit=tp2, stop=bullSl)
+    strategy.exit("LX3", "Long", qty=1, limit=tp3, stop=bullSl)
+    strategy.exit("LXT", "Long", qty=1, trail_points=risk, trail_offset=risk, stop=bullSl)
+
+if bearSignal and inWindow and not profitHalted and strategy.opentrades == 0
+    float risk = bearSl - bearEntry
+    if risk < 5.0
+        risk := 5.0
+    if risk > maxRiskPts
+        risk := maxRiskPts
+        bearSl := bearEntry + risk // FIXED: dynamically adjust the physical stop loss
+        
+    float tp1 = bearEntry - risk
+    float tp2 = bearEntry - (2 * risk)
+    float tp3 = bearEntry - (3 * risk)
+    
+    strategy.entry("Short", strategy.short, qty=qty, limit=bearEntry)
+    // FIX: Unique direction-prefixed IDs prevent TP label collision with Long exits
+    strategy.exit("SX1", "Short", qty=1, limit=tp1, stop=bearSl)
+    strategy.exit("SX2", "Short", qty=1, limit=tp2, stop=bearSl)
+    strategy.exit("SX3", "Short", qty=1, limit=tp3, stop=bearSl)
+    strategy.exit("SXT", "Short", qty=1, trail_points=risk, trail_offset=risk, stop=bearSl)
+
+
+// ==============================================================================
+// 6. VISUALS
+// ==============================================================================
+plotshape(bullSignal and inWindow, title="Bull Entry", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small)
+plotshape(bearSignal and inWindow, title="Bear Entry", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small)
+
+// Fixed scope error by ensuring color evaluation happens at column 0
+color kzColor = na
+if inNyAm
+    kzColor := color.new(color.blue, 95)
+else if inNyPm
+    kzColor := color.new(color.purple, 95)
+else if inLondon
+    kzColor := color.new(color.orange, 95)
+else if inAsia
+    kzColor := color.new(color.gray, 95)
+
+bgcolor(kzColor, title="Active Killzone")
+
+var table tb = table.new(position.top_right, 2, 2, bgcolor=color.new(color.black, 80), border_width=1)
+if barstate.islast
+    table.cell(tb, 0, 0, "Daily P&L:", text_color=color.white)
+    color pnlColor = currentDailyPnL >= 0 ? color.green : color.red
+    table.cell(tb, 1, 0, str.tostring(currentDailyPnL, "$#.##"), text_color=pnlColor)
+    
+    table.cell(tb, 0, 1, "Status:", text_color=color.white)
+    table.cell(tb, 1, 1, profitHalted ? "TARGET HIT" : "ACTIVE", text_color=profitHalted ? color.orange : color.green)

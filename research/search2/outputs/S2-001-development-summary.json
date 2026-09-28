@@ -1,0 +1,162 @@
+{
+  "candidate_id": "S2-001",
+  "family": "overnight_range_breakout",
+  "rules_hash": "da76e0571237ee480630ed0fcdaa46d3fc1093c5b9fe2332254559e10a1385bc",
+  "development_file_sha256": "8bbbdada95bb0007ad1a6cdff3c9bc52e6b19ee9e50ef315d8b7eca4ea570e5e",
+  "rules": {
+    "id": "S2-001",
+    "family": "overnight_range_breakout",
+    "overnight_et": "prior date 18:00 through current date 09:29",
+    "overnight_min_bars": 600,
+    "entry_window_et": "09:30..16:43 signal close; next bar open",
+    "trigger": "first close strictly outside overnight high/low",
+    "stop": "opposite overnight extreme",
+    "target": null,
+    "exit": "stop touch or close of final bar before 16:45 ET",
+    "cost": "1 tick adverse each market fill + $0.50/side commission",
+    "roll_policy": "exclude all session dates whose mapped overnight/RTH bars contain symbol transition",
+    "contracts": 1,
+    "random_seed": 20260928
+  },
+  "candidate": {
+    "label": "candidate",
+    "trades": 661,
+    "sessions": 661,
+    "gross_points_mean": 3.567700453857791,
+    "net_usd_per_trade": 5.135400907715582,
+    "net_2x_usd_per_trade": 3.1354009077155824,
+    "net_total_usd": 3394.5,
+    "net_total_2x_usd": 2072.5,
+    "win_rate_net": 0.4826021180030257,
+    "profit_factor_net": 1.0472771587743732,
+    "tstat_nw_daily": 0.5039405028218923,
+    "mean_mae_points": 91.49773071104387,
+    "mean_mfe_points": 105.59190620272315,
+    "top3_months_removed_net_usd": -2328.5,
+    "max_month_share": 0.8263367211665931,
+    "max_day_share": 0.3515981735159817,
+    "by_year_net_usd": {
+      "2021": -94.0,
+      "2022": 2997.5,
+      "2023": 999.5,
+      "2024": -508.5
+    },
+    "by_entry_hour_net_usd": {
+      "9": 3290.0,
+      "10": -1249.0,
+      "11": 2024.0,
+      "12": -1702.0,
+      "13": 728.0,
+      "14": 308.5,
+      "15": 0.0,
+      "16": -5.0
+    }
+  },
+  "extra_bar_delay": {
+    "label": "extra_bar_delay",
+    "trades": 661,
+    "sessions": 661,
+    "gross_points_mean": 3.145612708018154,
+    "net_usd_per_trade": 4.291225416036308,
+    "net_2x_usd_per_trade": 2.291225416036309,
+    "net_total_usd": 2836.5,
+    "net_total_2x_usd": 1514.5,
+    "win_rate_net": 0.4977307110438729,
+    "profit_factor_net": 1.0395559801139336,
+    "tstat_nw_daily": 0.42166639127037353,
+    "mean_mae_points": 91.40393343419062,
+    "mean_mfe_points": 104.55786686838124,
+    "top3_months_removed_net_usd": -3012.5,
+    "max_month_share": 0.9714436805922793,
+    "max_day_share": 0.4073682355014983,
+    "by_year_net_usd": {
+      "2021": -183.5,
+      "2022": 2596.0,
+      "2023": 1338.5,
+      "2024": -914.5
+    },
+    "by_entry_hour_net_usd": {
+      "9": 2737.0,
+      "10": -1295.5,
+      "11": 1945.0,
+      "12": -1647.5,
+      "13": 676.0,
+      "14": 316.0,
+      "15": 80.0,
+      "16": 25.5
+    }
+  },
+  "random_entry_control": {
+    "label": "random_entry",
+    "trades": 661,
+    "sessions": 661,
+    "gross_points_mean": 8.864599092284417,
+    "net_usd_per_trade": 15.729198184568835,
+    "net_2x_usd_per_trade": 13.729198184568835,
+    "net_total_usd": 10397.0,
+    "net_total_2x_usd": 9075.0,
+    "win_rate_net": 0.5022692889561271,
+    "profit_factor_net": 1.2351996380499943,
+    "tstat_nw_daily": 2.03142523825339,
+    "mean_mae_points": 60.98524962178517,
+    "mean_mfe_points": 75.29614220877458,
+    "top3_months_removed_net_usd": 4645.0,
+    "max_month_share": 0.19746080600173127,
+    "max_day_share": 0.10565547754159854,
+    "by_year_net_usd": {
+      "2021": -299.5,
+      "2022": 3878.5,
+      "2023": 2957.5,
+      "2024": 3860.5
+    },
+    "by_entry_hour_net_usd": {
+      "9": 3111.0,
+      "10": 4221.5,
+      "11": 2270.5,
+      "12": -677.5,
+      "13": 2074.5,
+      "14": -229.0,
+      "15": -686.0,
+      "16": 312.0
+    }
+  },
+  "opposite_side_control": {
+    "label": "opposite_side",
+    "trades": 661,
+    "sessions": 661,
+    "gross_points_mean": 1.6902420574886536,
+    "net_usd_per_trade": 1.380484114977307,
+    "net_2x_usd_per_trade": -0.6195158850226928,
+    "net_total_usd": 912.5,
+    "net_total_2x_usd": -409.5,
+    "win_rate_net": 0.443267776096823,
+    "profit_factor_net": 1.012594458438287,
+    "tstat_nw_daily": 0.12906939838686668,
+    "mean_mae_points": 88.20688350983359,
+    "mean_mfe_points": 111.45121028744327,
+    "top3_months_removed_net_usd": -6235.5,
+    "max_month_share": 4.232328767123287,
+    "max_day_share": 1.2575342465753425,
+    "by_year_net_usd": {
+      "2021": 995.5,
+      "2022": 753.5,
+      "2023": -1462.5,
+      "2024": 626.0
+    },
+    "by_entry_hour_net_usd": {
+      "9": 1549.0,
+      "10": 21.0,
+      "11": -871.5,
+      "12": 601.5,
+      "13": -127.0,
+      "14": -233.5,
+      "15": -24.0,
+      "16": -3.0
+    }
+  },
+  "day_block_bootstrap_2x_95ci_mean_daily_usd": [
+    -17.65824508320726,
+    24.89188729198183
+  ],
+  "seed": 20260928
+}

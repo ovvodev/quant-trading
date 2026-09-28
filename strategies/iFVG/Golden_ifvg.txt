@@ -1,0 +1,142 @@
+//@version=5
+indicator('FVG fill with immediate rebalance [LuciTech]', shorttitle = 'Golden Arrow [LuciTech]', overlay=true, max_bars_back=500, max_lines_count=500, max_boxes_count=500)
+
+// Golden Arrow Settings Group
+group_ga = "Golden Arrow"
+sga_show_fvg_box = input(true, "Show FVG", group = group_ga)
+sga_bull_fvg_color = input.color(color.rgb(0, 255, 0, 80), "Bullish FVG Color", group = group_ga)
+sga_bear_fvg_color = input.color(color.rgb(255, 0, 0, 80), "Bearish FVG Color", group = group_ga)
+sga_fvg_box_extend_bars = input.int(5, "Extend FVG", group = group_ga, minval=0)
+sga_require_same_direction_candles = input.bool(false, "Require Same Direction Candles", group = group_ga, tooltip="When enabled, all candles in the FVG must be in the same direction (bullish/bearish) for a valid signal")
+
+// FVG Inputs
+group_fvg_def = "FVG"
+sga_fvg_use_width_check = input(true, "Min Width", group = group_fvg_def)
+sga_fvg_min_width_value = input.float(0.3, "Min Width", group = group_fvg_def)
+sga_fvg_width_method = input.string("ATR", "Width Method", options=["Points", "%", "ATR"], group = group_fvg_def)
+sga_atr_len_for_fvg = input.int(14, "ATR Length for FVG Width", group = group_fvg_def)
+
+// Wick Penetration Settings Group
+group_wick = "FVG"
+sga_wick_penetration_method = input.string("Fraction of FVG", "Wick Fill Method", options=["Fraction of FVG", "ATR-based"], group = group_wick)
+sga_wick_fvg_fraction = input.float(0.25, "Min FVG Fill Fraction (e.g., 0.25 for 1/4)", group = group_wick, minval = 0.01, maxval = 1.0, step = 0.01)
+sga_wick_atr_multiplier = input.float(0.1, "Min ATR Fill Multiplier", group = group_wick, minval = 0.01, step = 0.01)
+sga_atr_len_for_wick = input.int(14, "ATR Length for Wick Fill", group = group_wick)
+
+// Time Filter Inputs
+use_time_filter = input.bool(false, title="Use Time Filter", group = 'Time Filter')
+start_hour = input.int(defval=0, title='Start Hour (24h)', minval=0, maxval=23, group = 'Time Filter')
+start_minute = input.int(defval=59, title='Start Minute', minval=0, maxval=59, group = 'Time Filter')
+end_hour = input.int(defval=23, title='End Hour (24h)', minval=0, maxval=23, group = 'Time Filter')
+end_minute = input.int(defval=59, title='End Minute', minval=0, maxval=59, group = 'Time Filter')
+showFill = input.bool(defval=false, title="Fill Background", inline = 'colour1', group = 'Time Filter')
+fillColor = input.color(color.rgb(192, 192, 192, 90), title='', inline = 'colour1', group = 'Time Filter')
+
+// --- ATR Values ---
+sga_atr_value_fvg = ta.atr(sga_atr_len_for_fvg)
+sga_atr_value_wick = ta.atr(sga_atr_len_for_wick)
+
+// Time filter function
+is_within_time_window() =>
+    current_time = time('1', 'America/New_York')
+    start_time = timestamp(year(current_time), month(current_time), dayofmonth(current_time), start_hour, start_minute, 0)
+    end_time = timestamp(year(current_time), month(current_time), dayofmonth(current_time), end_hour, end_minute, 0)
+    current_time >= start_time and current_time <= end_time
+
+inTimeRange = not use_time_filter or is_within_time_window()
+var color bgColor = na
+bgColor := showFill and use_time_filter and is_within_time_window() ? fillColor : na
+bgcolor(bgColor)
+
+// --- FVG Width Condition Check Function ---
+check_fvg_width_condition(use_check, method, threshold, atr_val, fvg_higher_price, fvg_lower_price) =>
+    meets_width_criteria = true
+    if use_check
+        actual_dist = math.abs(fvg_higher_price - fvg_lower_price)
+        meets_width_criteria := switch method
+            "Points" => actual_dist > threshold
+            "%"      => fvg_lower_price != 0 ? (actual_dist / fvg_lower_price * 100) > threshold : false
+            "ATR"    => actual_dist > (atr_val * threshold)
+            => true // Default if method is unknown
+    meets_width_criteria
+
+// --- Check for same direction candles ---
+check_same_direction_candles(is_bullish_fvg) =>
+    if not sga_require_same_direction_candles
+        true  // If feature is disabled, always return true
+    else
+        if is_bullish_fvg
+            // For bullish FVG, check if all candles are bullish (close > open)
+            close[1] > open[1] and close[2] > open[2] and close[3] > open[3]
+        else
+            // For bearish FVG, check if all candles are bearish (close < open)
+            close[1] < open[1] and close[2] < open[2] and close[3] < open[3]
+
+// --- Wick Penetration Check ---
+check_wick_penetration(is_bullish_fvg, fvg_top, fvg_bottom, fvg_height, current_low, current_high, atr_val_wick) =>
+    penetration_ok = false
+    if is_bullish_fvg // Bullish FVG, check low wick penetration
+        penetration_depth = fvg_top - current_low
+        if sga_wick_penetration_method == "Fraction of FVG"
+            penetration_ok := penetration_depth >= (fvg_height * sga_wick_fvg_fraction)
+        else if sga_wick_penetration_method == "ATR-based"
+            penetration_ok := penetration_depth >= (atr_val_wick * sga_wick_atr_multiplier)
+    else // Bearish FVG, check high wick penetration
+        penetration_depth = current_high - fvg_bottom
+        if sga_wick_penetration_method == "Fraction of FVG"
+            penetration_ok := penetration_depth >= (fvg_height * sga_wick_fvg_fraction)
+        else if sga_wick_penetration_method == "ATR-based"
+            penetration_ok := penetration_depth >= (atr_val_wick * sga_wick_atr_multiplier)
+    penetration_ok
+
+// FVG on Previous Bar (formed by candles [3],[2],[1])
+bull_fvg_top_prev = low[1]
+bull_fvg_bottom_prev = high[3]
+bull_fvg_height_prev = bull_fvg_top_prev - bull_fvg_bottom_prev
+bull_fvg_base_condition_prev = bull_fvg_height_prev > 0 and close[2] > bull_fvg_bottom_prev
+pass_bull_fvg_width_check_prev = check_fvg_width_condition(sga_fvg_use_width_check, sga_fvg_width_method, sga_fvg_min_width_value, sga_atr_value_fvg[1], bull_fvg_top_prev, bull_fvg_bottom_prev)
+pass_bull_direction_check = check_same_direction_candles(true)
+is_bull_fvg_on_prev_bar = bull_fvg_base_condition_prev and pass_bull_fvg_width_check_prev and pass_bull_direction_check
+
+bear_fvg_top_prev = low[3]
+bear_fvg_bottom_prev = high[1]
+bear_fvg_height_prev = bear_fvg_top_prev - bear_fvg_bottom_prev
+bear_fvg_base_condition_prev = bear_fvg_height_prev > 0 and close[2] < bear_fvg_top_prev
+pass_bear_fvg_width_check_prev = check_fvg_width_condition(sga_fvg_use_width_check, sga_fvg_width_method, sga_fvg_min_width_value, sga_atr_value_fvg[1], bear_fvg_top_prev, bear_fvg_bottom_prev)
+pass_bear_direction_check = check_same_direction_candles(false)
+is_bear_fvg_on_prev_bar = bear_fvg_base_condition_prev and pass_bear_fvg_width_check_prev and pass_bear_direction_check
+
+// Golden Arrow Signal on Current Bar [0]
+bullish_ga_signal = false
+bearish_ga_signal = false
+
+if is_bull_fvg_on_prev_bar and bull_fvg_height_prev > 0
+    wick_penetrated_bull = check_wick_penetration(true, bull_fvg_top_prev, bull_fvg_bottom_prev, bull_fvg_height_prev, low, high, sga_atr_value_wick)
+    bullish_ga_signal := (close > open) and 
+                         (low < bull_fvg_top_prev and low > bull_fvg_bottom_prev) and 
+                         wick_penetrated_bull and 
+                         (close > bull_fvg_top_prev) and
+                         inTimeRange
+
+if is_bear_fvg_on_prev_bar and bear_fvg_height_prev > 0
+    wick_penetrated_bear = check_wick_penetration(false, bear_fvg_top_prev, bear_fvg_bottom_prev, bear_fvg_height_prev, low, high, sga_atr_value_wick)
+    bearish_ga_signal := (close < open) and 
+                         (high > bear_fvg_bottom_prev and high < bear_fvg_top_prev) and 
+                         wick_penetrated_bear and 
+                         (close < bear_fvg_bottom_prev) and
+                         inTimeRange
+
+// Plot signals
+plotshape(bullish_ga_signal, "GA Bull", shape.triangleup, location.belowbar, sga_bull_fvg_color, size=size.tiny)
+plotshape(bearish_ga_signal, "GA Bear", shape.triangledown, location.abovebar, sga_bear_fvg_color, size=size.tiny)
+
+// Draw FVG boxes without text
+if bullish_ga_signal and sga_show_fvg_box
+    box.new(bar_index[3], bull_fvg_top_prev, bar_index + sga_fvg_box_extend_bars, bull_fvg_bottom_prev, bgcolor=sga_bull_fvg_color, border_color=na)
+
+if bearish_ga_signal and sga_show_fvg_box
+    box.new(bar_index[3], bear_fvg_top_prev, bar_index + sga_fvg_box_extend_bars, bear_fvg_bottom_prev, bgcolor=sga_bear_fvg_color, border_color=na)
+
+// Alert conditions
+alertcondition(bullish_ga_signal, title="Bullish Golden Arrow", message="Bullish Golden Arrow signal")
+alertcondition(bearish_ga_signal, title="Bearish Golden Arrow", message="Bearish Golden Arrow signal")

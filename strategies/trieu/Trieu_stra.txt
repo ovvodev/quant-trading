@@ -1,0 +1,469 @@
+// ============================================================================
+//  Confluence Trading System — Trieu Trades method
+//  v6 — dual signal engines, state-based Original signal, strict 50→200 mode,
+//       position-aware exits, close-confirmed signals, fixed balance anchor
+//
+//  Dual signal engines:
+//  1) Original Signal — 9/21 + 9/50 + price vs 50 SMA alignment
+//  2) Strict 50→200 — 9/50 cross + 50/200 separation + optional volume
+//  · Balance grid · relative-volume candle colouring · VWAP
+//  · swing HH/LH/HL/LL labels · per-condition status table · alerts
+//
+//  Runs ALONGSIDE a zone indicator (Flow IQ etc.) — deliberately does not
+//  draw supply/demand.
+// ============================================================================
+//@version=6
+indicator("Confluence System v6", overlay = true,
+     max_lines_count = 60, max_labels_count = 200)
+
+// ---------------------------------------------------------------------------
+// THEME
+// ---------------------------------------------------------------------------
+grpTheme = "Theme"
+theme    = input.string("Dark", "Palette", options = ["Dark", "Light", "Custom"],
+     group = grpTheme,
+     tooltip = "Dark / Light use built-in palettes. Choose Custom to enable the colour pickers below.")
+isDark   = theme == "Dark"
+isCustom = theme == "Custom"
+
+gcMA = "Custom Colours · MA Ladder"
+u50s  = input.color(#f2c14e, "50 SMA",  group = gcMA, inline = "ma1")
+u100s = input.color(#ff8fc4, "100 SMA", group = gcMA, inline = "ma1")
+u200s = input.color(#3a7a5e, "200 SMA", group = gcMA, inline = "ma1")
+u9e   = input.color(#5aa9ff, "9 EMA",   group = gcMA, inline = "ma2")
+u21e  = input.color(#e8eef4, "21 EMA",  group = gcMA, inline = "ma2")
+u50e  = input.color(#a83a4c, "50 EMA",  group = gcMA, inline = "ma2")
+uVwap = input.color(#9b8cff, "VWAP",    group = gcMA, inline = "ma3")
+
+gcCandle = "Custom Colours · Candles"
+uUp   = input.color(#3ecf8e, "Buy",            group = gcCandle, inline = "cd1")
+uDn   = input.color(#e8556a, "Sell",           group = gcCandle, inline = "cd1")
+uHiUp = input.color(#5aa9ff, "High-vol buy",   group = gcCandle, inline = "cd2")
+uHiDn = input.color(#f2c14e, "High-vol sell",  group = gcCandle, inline = "cd2")
+
+gcChrome = "Custom Colours · Grid, Labels & Signals"
+uGrid  = input.color(#FFFFFF, "Balance grid",     group = gcChrome, inline = "ch1")
+uLabTx = input.color(#0b0f14, "MA label text",    group = gcChrome, inline = "ch1")
+uPanel = input.color(#0b0f14, "Panel background", group = gcChrome, inline = "ch2")
+uPanFg = input.color(#7c8a99, "Panel text",       group = gcChrome, inline = "ch2")
+uSigUp = input.color(#3ecf8e, "Long marker",      group = gcChrome, inline = "ch3")
+uSigDn = input.color(#e8556a, "Short marker",     group = gcChrome, inline = "ch3")
+uTap   = input.color(#d4af6a, "Shoulder tap",     group = gcChrome, inline = "ch3")
+
+c50s  = isCustom ? u50s  : isDark ? #f2c14e : #E07B00
+c100s = isCustom ? u100s : isDark ? #ff8fc4 : #C2185B
+c200s = isCustom ? u200s : isDark ? #3a7a5e : #00796B
+c9e   = isCustom ? u9e   : isDark ? #5aa9ff : #1565C0
+c21e  = isCustom ? u21e  : isDark ? #e8eef4 : #37474F
+c50e  = isCustom ? u50e  : isDark ? #a83a4c : #6A1B9A
+cVwap = isCustom ? uVwap : isDark ? #9b8cff : #5E35B1
+
+cUp   = isCustom ? uUp   : isDark ? #3ecf8e : #00897B
+cDn   = isCustom ? uDn   : isDark ? #e8556a : #E53935
+cHiUp = isCustom ? uHiUp : isDark ? #5aa9ff : #0D47A1
+cHiDn = isCustom ? uHiDn : isDark ? #f2c14e : #EF6C00
+
+cGrid  = isCustom ? uGrid  : isDark ? #FFFFFF : #78909C
+cLabTx = isCustom ? uLabTx : isDark ? #0b0f14 : #FFFFFF
+cPanel = isCustom ? uPanel : isDark ? #0b0f14 : #FFFFFF
+cPanFg = isCustom ? uPanFg : isDark ? #7c8a99 : #37474F
+cSigUp = isCustom ? uSigUp : isDark ? #3ecf8e : #00897B
+cSigDn = isCustom ? uSigDn : isDark ? #e8556a : #E53935
+cTap   = isCustom ? uTap   : c50s
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+grpMA = "MA Ladder"
+showMA     = input.bool(true, "Show MA ladder", group = grpMA)
+showLabels = input.bool(true, "Show MA labels", group = grpMA)
+labOffset  = input.int(3, "Label offset (bars right)", minval = 1, maxval = 30, group = grpMA)
+sepMin     = input.float(30, "Min. 50↔200 separation to arm the setup",
+     minval = 0.1, group = grpMA,
+     tooltip = "In POINTS when the gate is set to Points, or in ATR multiples when set to ATR. Raise this on higher timeframes.")
+sepMode    = input.string("Points", "Separation measured in",
+     options = ["Points", "ATR multiple"], group = grpMA,
+     tooltip = "ATR multiple auto-scales the gate across 1m / 3m / 5m so you don't retune per chart.")
+atrLen     = input.int(14, "ATR length (for ATR mode)", minval = 1, group = grpMA)
+wSMA       = input.int(3, "SMA line width", minval = 1, maxval = 6, group = grpMA)
+wEMA       = input.int(1, "EMA line width", minval = 1, maxval = 6, group = grpMA)
+
+grpVwap = "VWAP"
+showVwap = input.bool(true, "Show VWAP", group = grpVwap,
+     tooltip = "Session VWAP — a target in its own right, and a dynamic support/resistance into the close.")
+
+grpSwing = "Swing Structure"
+showSwing  = input.bool(false, "Show swing labels (HH / LH / HL / LL)", group = grpSwing,
+     tooltip = "Off by default — on a 1-minute chart these multiply fast. Try it for a week before leaving it on.")
+swingLen   = input.int(10, "Swing pivot length", minval = 2, maxval = 50, group = grpSwing)
+
+grpBal = "Balance Grid"
+showBal  = input.bool(true, "Show balance grid", group = grpBal)
+balStep  = input.float(30, "Balance step (points)", minval = 0.25, group = grpBal)
+balAnchorMode = input.string("Manual", "Anchor mode", options = ["Manual", "Auto"], group = grpBal,
+     tooltip = "Manual follows the method's fixed-anchor workflow. Auto creates an anchor once from the current price for convenience.")
+balAnchorPrice = input.float(0.0, "Manual anchor price", step = 0.25, group = grpBal,
+     tooltip = "Set the first Balance level, e.g. 27418.25. Levels are then spaced by the Balance step.")
+balRange = input.int(6, "Lines above/below price", minval = 1, maxval = 15, group = grpBal)
+balTrans = input.int(45, "Grid transparency", minval = 0, maxval = 95, group = grpBal)
+showAnchorSuggestion = input.bool(true, "Show suggested anchor", group = grpBal,
+     tooltip = "Shows a nearby tradable price (rounded to the symbol tick) that you can use as the Manual anchor. It does not move the fixed grid automatically.")
+
+grpVol = "Volume Colouring"
+volMode = input.string("All candles", "Candle colouring",
+     options = ["Off", "Dots only", "High-volume candles", "All candles"], group = grpVol)
+volLen  = input.int(20, "Volume average length", minval = 1, group = grpVol)
+volMult = input.float(1.5, "High-volume multiplier (× average)",
+     minval = 1.0, step = 0.1, group = grpVol)
+
+grpSig = "Entry / Exit Signals"
+showSig     = input.bool(true, "Show entry/exit markers", group = grpSig)
+signalEngine = input.string("Original Signal", "Signal engine",
+     options = ["Original Signal", "Strict 50→200"], group = grpSig,
+     tooltip = "Original Signal matches the screenshot-style confluence: 9/21, 9/50 and price vs 50 SMA alignment. Strict 50→200 keeps the 30-point separation gate and requires the 9/50 cross.")
+requireVol  = input.bool(true, "Require high-volume confirmation on Strict entries", group = grpSig)
+showTrimTgt = input.bool(true, "Mark 100 MA (trim) / 200 MA (target) touches", group = grpSig)
+confirmOnClose = input.bool(true, "Confirm signals on bar close", group = grpSig,
+     tooltip = "Avoids intrabar signals that disappear before the candle closes.")
+
+grpTbl = "Status Table"
+showTable  = input.bool(true, "Show condition table", group = grpTbl)
+tablePosIn = input.string("Middle Right", "Table position",
+     options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Right",
+                "Bottom Left", "Bottom Center", "Bottom Right"], group = grpTbl)
+tblSizeIn  = input.string("Small", "Table text size",
+     options = ["Tiny", "Small", "Normal", "Large"], group = grpTbl)
+
+// ---------------------------------------------------------------------------
+// MOVING AVERAGES
+// ---------------------------------------------------------------------------
+sma50  = ta.sma(close, 50)
+sma100 = ta.sma(close, 100)
+sma200 = ta.sma(close, 200)
+ema9   = ta.ema(close, 9)
+ema21  = ta.ema(close, 21)
+ema50  = ta.ema(close, 50)
+
+plot(showMA ? sma50  : na, "50 SMA",  color = c50s,  linewidth = wSMA)
+plot(showMA ? sma100 : na, "100 SMA", color = c100s, linewidth = wSMA)
+plot(showMA ? sma200 : na, "200 SMA", color = c200s, linewidth = wSMA)
+plot(showMA ? ema9   : na, "9 EMA",   color = c9e,   linewidth = wEMA)
+plot(showMA ? ema21  : na, "21 EMA",  color = c21e,  linewidth = wEMA)
+plot(showMA ? ema50  : na, "50 EMA",  color = c50e,  linewidth = wEMA)
+
+// ---------------------------------------------------------------------------
+// VWAP  (guarded — ta.vwap errors on non-intraday charts)
+// ---------------------------------------------------------------------------
+isIntraday = timeframe.isintraday
+vwapVal    = isIntraday ? ta.vwap(close) : na
+plot(showVwap and isIntraday ? vwapVal : na, "VWAP", color = cVwap, linewidth = 2)
+
+// ---------------------------------------------------------------------------
+// MA + VWAP LABELS
+// ---------------------------------------------------------------------------
+var label L50s  = na
+var label L100s = na
+var label L200s = na
+var label L9e   = na
+var label L21e  = na
+var label L50e  = na
+var label LVwap = na
+
+drawTag(lb, y, txt, col) =>
+    if not na(lb)
+        label.delete(lb)
+    label.new(bar_index + labOffset, y, txt, color = col, textcolor = cLabTx,
+         style = label.style_label_left, size = size.tiny)
+
+if showMA and showLabels and barstate.islast
+    L50s  := drawTag(L50s,  sma50,  "50 MA",  c50s)
+    L100s := drawTag(L100s, sma100, "100 MA", c100s)
+    L200s := drawTag(L200s, sma200, "200 MA", c200s)
+    L9e   := drawTag(L9e,   ema9,   "9 EMA",  c9e)
+    L21e  := drawTag(L21e,  ema21,  "21 EMA", c21e)
+    L50e  := drawTag(L50e,  ema50,  "50 EMA", c50e)
+
+if showVwap and showLabels and isIntraday and barstate.islast
+    LVwap := drawTag(LVwap, vwapVal, "VWAP", cVwap)
+
+// ---------------------------------------------------------------------------
+// SEPARATION GATE  (points or ATR-scaled)
+// ---------------------------------------------------------------------------
+separation = math.abs(sma50 - sma200)
+atrVal     = ta.atr(atrLen)
+sepThresh  = sepMode == "ATR multiple" ? atrVal * sepMin : sepMin
+armed      = separation >= sepThresh
+
+// ---------------------------------------------------------------------------
+// VOLUME COLOURING  (relative to its own average — self-scaling)
+// ---------------------------------------------------------------------------
+volAvg  = ta.sma(volume, volLen)
+highVol = volume > volAvg * volMult
+isUp    = close >= open
+
+candleCol = volMode == "All candles"
+     ? (highVol ? (isUp ? cHiUp : cHiDn) : (isUp ? cUp : cDn))
+     : volMode == "High-volume candles"
+         ? (highVol ? (isUp ? cHiUp : cHiDn) : na)
+         : na
+
+barcolor(candleCol, title = "Volume candle colouring")
+
+plotshape(volMode == "Dots only" and highVol and isUp, title = "High-volume buy",
+     style = shape.circle, location = location.belowbar, color = cHiUp, size = size.tiny)
+plotshape(volMode == "Dots only" and highVol and not isUp, title = "High-volume sell",
+     style = shape.circle, location = location.abovebar, color = cHiDn, size = size.tiny)
+
+// ---------------------------------------------------------------------------
+// SWING STRUCTURE LABELS — HH / LH / HL / LL
+// ---------------------------------------------------------------------------
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low,  swingLen, swingLen)
+
+var float lastPH = na
+var float lastPL = na
+
+if showSwing and not na(ph)
+    txt = na(lastPH) ? "H" : (ph >= lastPH ? "HH" : "LH")
+    label.new(bar_index - swingLen, ph, txt, style = label.style_label_down,
+         color = color.new(cSigDn, 82), textcolor = cSigDn, size = size.tiny)
+    lastPH := ph
+
+if showSwing and not na(pl)
+    txt = na(lastPL) ? "L" : (pl >= lastPL ? "HL" : "LL")
+    label.new(bar_index - swingLen, pl, txt, style = label.style_label_up,
+         color = color.new(cSigUp, 82), textcolor = cSigUp, size = size.tiny)
+    lastPL := pl
+
+// ---------------------------------------------------------------------------
+// BALANCE GRID — fixed anchor, matching the manual workflow
+// ---------------------------------------------------------------------------
+var line[] balLines = array.new_line()
+var float balanceAnchor = na
+var label anchorSuggestionLabel = na
+
+// Nearby tradable anchor helper. This is only a suggestion for Manual mode;
+// it does not alter the fixed Balance grid unless the user enters it manually.
+suggestedAnchor = math.round(close / syminfo.mintick) * syminfo.mintick
+
+// Manual anchor takes effect immediately and is re-read if you change it.
+// The auto fallback is seeded from the LAST bar (current price), not the first
+// bar of loaded history — otherwise the grid lands thousands of points away.
+if balAnchorMode == "Manual" and balAnchorPrice != 0
+    balanceAnchor := balAnchorPrice
+else if na(balanceAnchor) and barstate.islast
+    balanceAnchor := math.round(close / balStep) * balStep
+
+if showBal and barstate.islast
+    if array.size(balLines) > 0
+        for i = 0 to array.size(balLines) - 1
+            line.delete(array.get(balLines, i))
+        array.clear(balLines)
+
+    for i = -balRange to balRange
+        lvl = balanceAnchor + i * balStep
+        ln  = line.new(bar_index - 300, lvl, bar_index + labOffset, lvl,
+             extend = extend.left, color = color.new(cGrid, balTrans),
+             width = 1, style = line.style_dotted)
+        array.push(balLines, ln)
+
+// Anchor suggestion label: a nearby current-price reference for the next manual
+// grid anchor. The grid itself remains fixed until the Manual anchor is changed.
+if barstate.islast
+    if not na(anchorSuggestionLabel)
+        label.delete(anchorSuggestionLabel)
+    if showBal and showAnchorSuggestion
+        anchorSuggestionLabel := label.new(
+             bar_index + labOffset, suggestedAnchor,
+             "Suggested anchor\n" + str.tostring(suggestedAnchor, format.mintick),
+             xloc = xloc.bar_index, yloc = yloc.price,
+             style = label.style_label_left,
+             color = cPanel, textcolor = cPanFg, size = size.tiny)
+
+// ---------------------------------------------------------------------------
+// CONDITION STATE + SIGNAL ENGINES
+// ---------------------------------------------------------------------------
+cond921Long  = ema9 > ema21
+cond950Long  = ema9 > ema50
+condSmaLong  = close > sma50
+cond921Short = ema9 < ema21
+cond950Short = ema9 < ema50
+condSmaShort = close < sma50
+
+// Event conditions used by the strict engine.
+crossUp      = ta.crossover(ema9, ema50)
+crossDown    = ta.crossunder(ema9, ema50)
+// Screenshot-style Original Signal:
+// fire when the three directional states become aligned, rather than waiting
+// for the 50→200 separation gate. This reproduces the behaviour seen in the
+// supplied original chart more closely.
+originalLongState  = cond921Long and cond950Long and condSmaLong
+originalShortState = cond921Short and cond950Short and condSmaShort
+originalLong  = originalLongState and not originalLongState[1]
+originalShort = originalShortState and not originalShortState[1]
+
+// Strict setup from the manual: 50/200 separation + 9/50 trigger, with
+// optional volume confirmation.
+strictLong  = crossUp   and armed and (not requireVol or highVol)
+strictShort = crossDown and armed and (not requireVol or highVol)
+
+engineLong  = signalEngine == "Original Signal" ? originalLong  : strictLong
+engineShort = signalEngine == "Original Signal" ? originalShort : strictShort
+
+confirmedBar = not confirmOnClose or barstate.isconfirmed
+longSignal   = engineLong  and confirmedBar
+shortSignal  = engineShort and confirmedBar
+
+// Position-aware state. Exits only print after the corresponding signal has
+// actually put the indicator into a long/short state.
+var int positionState = 0
+
+if longSignal
+    positionState := 1
+else if shortSignal
+    positionState := -1
+
+exitLong  = positionState == 1 and ta.crossunder(close, ema9) and confirmedBar
+exitShort = positionState == -1 and ta.crossover(close, ema9) and confirmedBar
+
+if exitLong or exitShort
+    positionState := 0
+
+plotshape(showSig and longSignal,  title = "Long entry",  style = shape.triangleup,
+     location = location.belowbar, color = cSigUp, size = size.small, text = "L")
+plotshape(showSig and shortSignal, title = "Short entry", style = shape.triangledown,
+     location = location.abovebar, color = cSigDn, size = size.small, text = "S")
+
+tapUp   = ta.crossover(ema9, ema21)
+tapDown = ta.crossunder(ema9, ema21)
+plotshape(showSig and tapUp,   title = "Shoulder tap up",   style = shape.circle,
+     location = location.belowbar, color = color.new(cTap, 25), size = size.tiny)
+plotshape(showSig and tapDown, title = "Shoulder tap down", style = shape.circle,
+     location = location.abovebar, color = color.new(cTap, 25), size = size.tiny)
+
+plotshape(showSig and exitLong,  title = "Exit long (9 EMA break)",  style = shape.xcross,
+     location = location.belowbar, color = cSigDn, size = size.tiny)
+plotshape(showSig and exitShort, title = "Exit short (9 EMA break)", style = shape.xcross,
+     location = location.abovebar, color = cSigUp, size = size.tiny)
+
+// ---------------------------------------------------------------------------
+// TRIM / TARGET TOUCHES   (plotted at the MA price, not at zero)
+// ---------------------------------------------------------------------------
+touched100 = ta.cross(close, sma100)
+touched200 = ta.cross(close, sma200)
+
+plotshape(showTrimTgt and touched100 ? sma100 : na, title = "100 MA touch (trim)",
+     style = shape.diamond, location = location.absolute, color = c100s, size = size.tiny)
+plotshape(showTrimTgt and touched200 ? sma200 : na, title = "200 MA touch (target)",
+     style = shape.diamond, location = location.absolute, color = c200s, size = size.tiny)
+
+// ---------------------------------------------------------------------------
+// ALERTS
+// ---------------------------------------------------------------------------
+alertcondition(longSignal,  title = "Confluence Long",
+     message = "Confluence LONG on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(shortSignal, title = "Confluence Short",
+     message = "Confluence SHORT on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(tapUp or tapDown, title = "Shoulder Tap",
+     message = "9/21 EMA cross — prepare, do not enter")
+alertcondition(touched100, title = "100 MA Touch",
+     message = "Price touched the 100 MA — trim level")
+alertcondition(touched200, title = "200 MA Touch",
+     message = "Price touched the 200 MA — target level")
+alertcondition(exitLong,  title = "Trail Exit — Long",
+     message = "Candle closed back through the 9 EMA — long trail broken")
+alertcondition(exitShort, title = "Trail Exit — Short",
+     message = "Candle closed back through the 9 EMA — short trail broken")
+
+// ---------------------------------------------------------------------------
+// CONDITION TABLE
+// ---------------------------------------------------------------------------
+tablePos = switch tablePosIn
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Middle Left"   => position.middle_left
+    "Middle Right"  => position.middle_right
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    "Bottom Right"  => position.bottom_right
+    => position.middle_right
+
+tblSize = switch tblSizeIn
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+
+var table t = table.new(tablePos, 4, 7, border_width = 1,
+     border_color = color.new(cGrid, 55))
+
+cellBg = color.new(cPanel, 6)
+okCol  = c200s
+noCol  = cDn
+muted  = cPanFg
+
+if showTable and barstate.islast
+    table.cell(t, 0, 0, "CONDITION", bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    table.cell(t, 1, 0, "STATE",     bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    table.cell(t, 2, 0, "L",         bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    table.cell(t, 3, 0, "S",         bgcolor = cellBg, text_color = muted, text_size = tblSize)
+
+    // 50/200 context: shown, but not a hard gate in Original Signal mode.
+    table.cell(t, 0, 1, "50↔200 sep", bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    table.cell(t, 1, 1, str.tostring(math.round(separation, 1)) + " pts",
+         bgcolor = cellBg, text_color = armed ? okCol : noCol, text_size = tblSize)
+    sepTag = armed ? "OK" : "< " + str.tostring(math.round(sepThresh, 1))
+    table.cell(t, 2, 1, sepTag, bgcolor = cellBg,
+         text_color = armed ? okCol : noCol, text_size = tblSize)
+    table.cell(t, 3, 1, sepTag, bgcolor = cellBg,
+         text_color = armed ? okCol : noCol, text_size = tblSize)
+
+    table.cell(t, 0, 2, "9 / 21 EMA", bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    ema921State = cond921Long ? "BULLISH" : cond921Short ? "BEARISH" : "FLAT"
+    table.cell(t, 1, 2, ema921State, bgcolor = cellBg,
+         text_color = cond921Long ? okCol : cond921Short ? noCol : muted, text_size = tblSize)
+    table.cell(t, 2, 2, cond921Long ? "✓" : "—", bgcolor = cellBg,
+         text_color = cond921Long ? okCol : muted, text_size = tblSize)
+    table.cell(t, 3, 2, cond921Short ? "✓" : "—", bgcolor = cellBg,
+         text_color = cond921Short ? noCol : muted, text_size = tblSize)
+
+    table.cell(t, 0, 3, "9 / 50 EMA", bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    ema950State = cond950Long ? "BULLISH" : cond950Short ? "BEARISH" : "FLAT"
+    table.cell(t, 1, 3, ema950State, bgcolor = cellBg,
+         text_color = cond950Long ? okCol : cond950Short ? noCol : muted, text_size = tblSize)
+    table.cell(t, 2, 3, cond950Long ? "✓" : "—", bgcolor = cellBg,
+         text_color = cond950Long ? okCol : muted, text_size = tblSize)
+    table.cell(t, 3, 3, cond950Short ? "✓" : "—", bgcolor = cellBg,
+         text_color = cond950Short ? noCol : muted, text_size = tblSize)
+
+    table.cell(t, 0, 4, "50 SMA CROSS", bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    smaState = condSmaLong ? "ABOVE" : condSmaShort ? "BELOW" : "AT MA"
+    table.cell(t, 1, 4, smaState, bgcolor = cellBg,
+         text_color = condSmaLong ? okCol : condSmaShort ? noCol : muted, text_size = tblSize)
+    table.cell(t, 2, 4, condSmaLong ? "✓" : "—", bgcolor = cellBg,
+         text_color = condSmaLong ? okCol : muted, text_size = tblSize)
+    table.cell(t, 3, 4, condSmaShort ? "✓" : "—", bgcolor = cellBg,
+         text_color = condSmaShort ? noCol : muted, text_size = tblSize)
+
+    table.cell(t, 0, 5, "VOLUME", bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    volState = highVol ? "HIGH" : "NORMAL"
+    table.cell(t, 1, 5, volState, bgcolor = cellBg,
+         text_color = highVol ? okCol : muted, text_size = tblSize)
+    table.cell(t, 2, 5, highVol ? "✓" : "—", bgcolor = cellBg,
+         text_color = highVol ? okCol : muted, text_size = tblSize)
+    table.cell(t, 3, 5, highVol ? "✓" : "—", bgcolor = cellBg,
+         text_color = highVol ? noCol : muted, text_size = tblSize)
+
+    originalBias = originalLongState ? "LONG" : originalShortState ? "SHORT" : "MIXED"
+    strictBias = strictLong ? "LONG" : strictShort ? "SHORT" : armed ? "ARMED" : "NO SETUP"
+    verdict = signalEngine == "Original Signal" ? originalBias : strictBias
+    verdictCol = verdict == "LONG" ? okCol : verdict == "SHORT" ? noCol : muted
+
+    table.cell(t, 0, 6, "FINAL SIGNAL", bgcolor = cellBg, text_color = muted, text_size = tblSize)
+    table.cell(t, 1, 6, verdict, bgcolor = cellBg, text_color = verdictCol, text_size = tblSize)
+    table.cell(t, 2, 6, longSignal ? "✓" : "—", bgcolor = cellBg,
+         text_color = longSignal ? okCol : muted, text_size = tblSize)
+    table.cell(t, 3, 6, shortSignal ? "✓" : "—", bgcolor = cellBg,
+         text_color = shortSignal ? noCol : muted, text_size = tblSize)

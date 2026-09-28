@@ -1,0 +1,247 @@
+//@version=6
+// =============================================================================
+// PROP FIRM INTRADAY MOMENTUM (NOISE AREA) STRATEGY (v6)
+// =============================================================================
+// Pine port of "Prop Firm Intraday Momentum backtest.py" from this repository.
+// Rules from Zarattini, Aziz & Barbon (2024), "Beat the Market: An Effective
+// Intraday Momentum Strategy for S&P500 ETF (SPY)", used with the published
+// parameters:
+//   1. noise area: for every minute of the regular session, sigma(t) = the
+//      average over the last 14 sessions of |close(t) / session open - 1|
+//   2. upper band = max(open, prev close) * (1 + sigma(t))
+//      lower band = min(open, prev close) * (1 - sigma(t))
+//   3. only at 10:00, 10:30 ... 15:30 New York: close above the upper band ->
+//      long, below the lower band -> short. inside the bands is noise.
+//   4. trailing exit at the same half hours: exit a long when close falls
+//      below max(upper band, session VWAP), a short when close rises above
+//      min(lower band, session VWAP). flat at 16:00.
+// plus a protective stop one noise-band width (sigma * open) from entry,
+// chosen on 2021-09..2024-03 data and confirmed on 2024-04..2026-09.
+//
+// RESULT on 5 years of MNQ 1-minute data (Python backtest, net of $0.70 round
+// trip + 1 tick per fill): ~225 trades/yr, ~+$18 per contract per trade,
+// t-stat ~2.7, positive in every year; the opposite-side control loses about
+// as much (t -3.2). on a generic 50k evaluation with a $2k END-OF-DAY
+// trailing max loss, 2 MNQ passed ~48% of repeated evaluations vs ~23% for a
+// zero-edge strategy. prefer end-of-day trailing firms: intraday trailing
+// ratchets the floor on open profit, which a trend strategy gives back.
+// CAVEAT: profit is concentrated in volatile stretches (April 2025 alone made
+// 19% of it) and from May 2025 to September 2026 it made ~$0 per trade.
+// paper trade it before paying for an evaluation.
+// see "Prop Firm Scalping review.md" for the full search and its caveats.
+//
+// usage notes:
+//   - use a 5 MINUTE chart of MNQ (1, 15 and 30 minute also work - anything
+//     that divides 30 minutes). the first 14 sessions on the chart only build
+//     the noise area and nothing trades until then. MNQ trades ~23 hours a
+//     day, so 14 sessions of 1 minute bars is ~20,000 bars - more than
+//     TradingView loads on most plans, which leaves the strategy with no
+//     signals at all. on 5 minute bars it is ~4,000 bars. the Python
+//     backtest gives the same result on 1, 5 and 30 minute bars (+$18.44,
+//     +$18.36, +$19.65 per contract per trade).
+//   - bars are identified by their CLOSE time, so "the 10:00 check" is the
+//     bar that closes at 10:00 on any timeframe.
+//   - regular-hours bars must be on the chart; extended hours are fine.
+//   - process_orders_on_close = true: signals and exits fill at the close of
+//     the half-hour bar, exactly like the Python backtest.
+//   - like the Python backtest, half-day sessions (early close) are left out
+//     of the noise area and are not used as the previous close. checked
+//     against TradingView exports on 5, 15 and 30 minute charts: trades match
+//     the Python backtest one for one, apart from a few ticks of fill price.
+//   - educational strategy, not investment advice.
+// =============================================================================
+
+strategy("Prop Firm Intraday Momentum", overlay = true,
+     initial_capital = 50000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 2,
+     pyramiding = 0,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0.35,
+     slippage = 1,
+     process_orders_on_close = true)
+
+// ------------------------------------------------------------------ inputs
+grpSig = "Signal"
+int lookback      = input.int(14, "Noise Area Lookback (sessions)", minval = 2, group = grpSig)
+int checkEvery    = input.int(30, "Check Every (minutes)", minval = 1, group = grpSig)
+int firstCheck    = input.int(600, "First Check (minutes after midnight, 600 = 10:00)", group = grpSig)
+float stopBand    = input.float(1.0, "Protective Stop (x noise band, 0 = off)", minval = 0, step = 0.25, group = grpSig)
+int contracts     = input.int(2, "Contracts", minval = 1, group = grpSig,
+     tooltip = "2 MNQ tested best on a 50k evaluation with a $2,000 end-of-day trailing max loss.")
+string tz         = input.string("America/New_York", "Session Timezone", options = ["America/New_York"], group = grpSig)
+
+grpProp = "Prop Firm Rules ($)"
+string ddMode      = input.string("Futures $ trailing, end of day", "Drawdown Rule",
+     options = ["Off", "Futures $ trailing, end of day", "Futures $ trailing, intraday"], group = grpProp)
+float maxLossUsd   = input.float(2000, "Max Loss $ (trailing)", minval = 0, group = grpProp)
+float targetUsd    = input.float(3000, "Profit Target $ (stop trading once reached)", minval = 0, group = grpProp)
+float dailyLossUsd = input.float(1000, "Daily Loss $ (0 = none)", minval = 0, group = grpProp)
+
+// --------------------------------------------------------------- session
+int RTH_OPEN  = 570   // 09:30
+int RTH_CLOSE = 960   // 16:00
+int NMIN      = RTH_CLOSE - RTH_OPEN
+
+int tfSec = timeframe.in_seconds(timeframe.period)
+if barstate.isfirst and (not timeframe.isintraday or tfSec > 1800 or 1800 % tfSec != 0)
+    runtime.error("Use a 1, 5, 15 or 30 minute chart (the timeframe must divide 30 minutes).")
+
+// minute of day at which this bar CLOSES (a 1 min bar opening 09:59 and a
+// 30 min bar opening 09:30 both close at 600 = 10:00)
+int  mod      = hour(time_close, tz) * 60 + minute(time_close, tz)
+bool inRth    = mod > RTH_OPEN and mod <= RTH_CLOSE
+bool rthStart = inRth and (not inRth[1] or dayofmonth(time_close, tz) != dayofmonth(time_close[1], tz))
+
+// noise area bookkeeping: today's |close/open - 1| per minute, plus running
+// per-minute sums/counts over the last `lookback` finished sessions
+var array<float> today  = array.new<float>(NMIN, na)
+var matrix<float> hist  = matrix.new<float>(0, NMIN)
+var array<float> sumArr = array.new<float>(NMIN, 0.0)
+var array<int>   cntArr = array.new<int>(NMIN, 0)
+
+var float dayOpen      = na
+var float prevClose    = na
+var float lastRthClose = na
+var float cumPV        = 0.0
+var float cumV         = 0.0
+var bool  hadSession   = false
+var int   dayFirstMod  = na
+var int   dayLastMod   = na
+
+if rthStart
+    // only COMPLETE sessions count: skip half days (early close, e.g. the day
+    // after Thanksgiving or Labor Day) and a first session the chart history
+    // starts in the middle of. a skipped day neither enters the noise area nor
+    // becomes the "previous close" - identical to the Python backtest.
+    bool complete = hadSession and dayFirstMod == RTH_OPEN + tfSec / 60 and dayLastMod == RTH_CLOSE
+    if complete
+        // archive yesterday into the rolling window
+        matrix.add_row(hist, matrix.rows(hist), array.copy(today))
+        for c = 0 to NMIN - 1
+            float v = array.get(today, c)
+            if not na(v)
+                array.set(sumArr, c, array.get(sumArr, c) + v)
+                array.set(cntArr, c, array.get(cntArr, c) + 1)
+        if matrix.rows(hist) > lookback
+            array<float> old = matrix.row(hist, 0)
+            for c = 0 to NMIN - 1
+                float v = array.get(old, c)
+                if not na(v)
+                    array.set(sumArr, c, array.get(sumArr, c) - v)
+                    array.set(cntArr, c, array.get(cntArr, c) - 1)
+            matrix.remove_row(hist, 0)
+        prevClose := lastRthClose
+    array.fill(today, na)
+    dayFirstMod := mod
+    dayOpen := open
+    cumPV := 0.0
+    cumV := 0.0
+    hadSession := true
+
+float sigma = na
+float vwapRth = na
+if inRth and not na(dayOpen)
+    int idx = mod - RTH_OPEN - 1
+    array.set(today, idx, math.abs(close / dayOpen - 1))
+    cumPV += hlc3 * math.max(volume, 1)
+    cumV += math.max(volume, 1)
+    vwapRth := cumPV / cumV
+    lastRthClose := close
+    dayLastMod := mod
+    int cnt = array.get(cntArr, idx)
+    sigma := matrix.rows(hist) >= lookback and cnt > 0 ? array.get(sumArr, idx) / cnt : na
+
+float top   = na(prevClose) ? na : math.max(dayOpen, prevClose)
+float bot   = na(prevClose) ? na : math.min(dayOpen, prevClose)
+float upper = na(sigma) or na(top) ? na : top * (1 + sigma)
+float lower = na(sigma) or na(bot) ? na : bot * (1 - sigma)
+
+plot(upper, "Upper Noise Band", color = color.new(color.green, 30), style = plot.style_linebr)
+plot(lower, "Lower Noise Band", color = color.new(color.red, 30), style = plot.style_linebr)
+plot(inRth ? vwapRth : na, "Session VWAP", color = color.new(color.gray, 20), style = plot.style_linebr)
+
+// ---------------------------------------------------- prop firm risk state
+float closedEquity = strategy.initial_capital + strategy.netprofit
+var float usdHwm         = strategy.initial_capital
+var float dayStartEquity = strategy.initial_capital
+var bool  dayHalted      = false
+var bool  permHalted     = false
+var bool  targetHit      = false
+bool propOn = ddMode != "Off"
+
+if rthStart
+    if ddMode == "Futures $ trailing, end of day"
+        usdHwm := math.max(usdHwm, closedEquity)
+    dayStartEquity := closedEquity
+    dayHalted := false
+if ddMode == "Futures $ trailing, intraday"
+    usdHwm := math.max(usdHwm, strategy.equity)
+float usdFloor = math.min(usdHwm - maxLossUsd, strategy.initial_capital)
+
+if propOn
+    if strategy.equity <= usdFloor
+        permHalted := true
+    if dailyLossUsd > 0 and dayStartEquity - strategy.equity >= dailyLossUsd
+        dayHalted := true
+    if not targetHit and closedEquity - strategy.initial_capital >= targetUsd
+        targetHit := true
+if (permHalted or dayHalted) and strategy.position_size != 0
+    strategy.close_all(comment = permHalted ? "max loss breached" : "daily loss hit")
+
+// ------------------------------------------------------------ signals
+// a check "at 10:00" acts on the bar that closes at 10:00
+bool isMark   = inRth and mod >= firstCheck and mod < RTH_CLOSE and (mod - firstCheck) % checkEvery == 0
+bool sessEnd  = inRth and mod >= RTH_CLOSE
+bool ready    = isMark and not na(upper) and not na(lower) and not na(vwapRth)
+bool longSig  = ready and close > upper
+bool shortSig = ready and close < lower
+bool canEnter = not permHalted and not dayHalted and not targetHit
+
+// trailing exits. stay in if the same-side entry would fire again; if the
+// OPPOSITE entry fires, strategy.entry below reverses the position itself
+// (closing here as well would over-sell on the same bar)
+if ready and strategy.position_size > 0 and close < math.max(upper, vwapRth) and not longSig and not (shortSig and canEnter)
+    strategy.close("Long", comment = "trail")
+if ready and strategy.position_size < 0 and close > math.min(lower, vwapRth) and not shortSig and not (longSig and canEnter)
+    strategy.close("Short", comment = "trail")
+
+float stopDist = stopBand * nz(sigma) * nz(dayOpen)
+if canEnter and longSig and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, qty = contracts)
+    if stopBand > 0
+        strategy.exit("Long SL", "Long", stop = close - stopDist)
+if canEnter and shortSig and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, qty = contracts)
+    if stopBand > 0
+        strategy.exit("Short SL", "Short", stop = close + stopDist)
+
+if sessEnd and strategy.position_size != 0
+    strategy.close_all(comment = "session end")
+
+// ------------------------------------------------------------------ dashboard
+string status = permHalted ? "MAX LOSS BREACHED" : targetHit ? "TARGET REACHED" : dayHalted ? "DAILY LIMIT HIT" : "Active"
+var table tbl = table.new(position.top_right, 2, 6, border_width = 1)
+if barstate.islast
+    table.cell(tbl, 0, 0, "Intraday Momentum", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(tbl, 1, 0, status, bgcolor = permHalted ? color.new(color.red, 60) : targetHit ? color.new(color.green, 60) : na)
+    table.cell(tbl, 0, 1, "Net P&L")
+    table.cell(tbl, 1, 1, "$" + str.tostring(strategy.netprofit, "#,##0"))
+    table.cell(tbl, 0, 2, "Room to Max Loss")
+    table.cell(tbl, 1, 2, propOn ? "$" + str.tostring(strategy.equity - usdFloor, "#,##0") : "off")
+    bool building = matrix.rows(hist) < lookback
+    table.cell(tbl, 0, 3, "Sessions in Noise Area")
+    table.cell(tbl, 1, 3, str.tostring(matrix.rows(hist)) + " / " + str.tostring(lookback) + (building ? "  NOT READY" : ""),
+         bgcolor = building ? color.new(color.orange, 60) : na)
+    table.cell(tbl, 0, 4, "Contracts")
+    table.cell(tbl, 1, 4, str.tostring(contracts))
+    table.cell(tbl, 0, 5, "Drawdown Rule")
+    table.cell(tbl, 1, 5, ddMode)
+
+// no signals until the noise area has `lookback` sessions - say so on the chart
+var label warn = na
+if barstate.islast and matrix.rows(hist) < lookback
+    label.delete(warn)
+    warn := label.new(bar_index, high, "Not enough history: " + str.tostring(matrix.rows(hist)) + " of " + str.tostring(lookback) +
+         " sessions loaded.\nNo signals until " + str.tostring(lookback) + " sessions are on the chart -\nswitch to a 5 minute chart.",
+         style = label.style_label_down, color = color.new(color.orange, 10), textcolor = color.white)

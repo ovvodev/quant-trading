@@ -1,0 +1,50 @@
+{
+  "generic_50k": {
+    "account": 50000,
+    "target": 3000,
+    "max_loss": 2000,
+    "trailing": "intraday",
+    "daily_loss": 1000,
+    "consistency": 0.4,
+    "max_contracts": 5,
+    "flat_time": "16:45",
+    "commission_per_side": 0.5,
+    "slippage_ticks": 1.0,
+    "tick_size": 0.25,
+    "point_value": 2.0,
+    "news_blackout": [],
+    "min_days": 0
+  },
+  "topstep_50k": {
+    "account": 50000,
+    "target": 3000,
+    "max_loss": 2000,
+    "trailing": "eod",
+    "daily_loss": 1000,
+    "consistency": 0.5,
+    "max_contracts": 5,
+    "flat_time": "16:45",
+    "commission_per_side": 0.5,
+    "slippage_ticks": 1.0,
+    "tick_size": 0.25,
+    "point_value": 2.0,
+    "news_blackout": [],
+    "min_days": 2
+  },
+  "apex_50k": {
+    "account": 50000,
+    "target": 3000,
+    "max_loss": 2500,
+    "trailing": "eod",
+    "daily_loss": null,
+    "consistency": null,
+    "max_contracts": 5,
+    "flat_time": "16:45",
+    "commission_per_side": 0.5,
+    "slippage_ticks": 1.0,
+    "tick_size": 0.25,
+    "point_value": 2.0,
+    "news_blackout": [],
+    "min_days": 7
+  }
+}

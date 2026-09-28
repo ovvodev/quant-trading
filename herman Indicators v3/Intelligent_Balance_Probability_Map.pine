@@ -1,0 +1,816 @@
+//@version=6
+indicator("Intelligent Balance Probability Map+ [Herman]", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// =============================================================================
+// 1. USER INPUTS & CONFIGURATION
+// =============================================================================
+
+// --- A. IB SESSION SETTINGS ---
+grp_sess            = "IB SESSION"
+ib_session          = input.session("0930-1030:1234567", "IB Session (NY Time)", group = grp_sess, tooltip = "Session window in NY time (e.g. 0930-1030 or 0930-0945).")
+tz                  = input.string("America/New_York", "Timezone", group = grp_sess)
+ib_bg_color         = input.color(color.new(#787b86, 92), "IB Box Background", group = grp_sess, tooltip = "Normal IB box background fill when Probability Heatmap is OFF.")
+ib_border_color     = input.color(color.new(#787b86, 50), "IB Border Color", group = grp_sess, tooltip = "Normal IB box border color.")
+highlight_edge      = input.bool(true, "Highlight Edge Sessions", group = grp_sess, tooltip = "Thickens and highlights the border on high-probability Edge setups.")
+edge_border_width   = input.int(2, "Edge Border Width", minval = 1, maxval = 10, group = grp_sess, tooltip = "Border thickness for Edge sessions.")
+
+// --- B. PREMIUM QUANT MATRIX ---
+grp_quant           = "PREMIUM QUANT MATRIX"
+show_vwap           = input.bool(true, "Show VWAP", group = grp_quant, tooltip = "Displays session VWAP on the chart.")
+col_vwap            = input.color(#ff9800, "VWAP Color", group = grp_quant)
+show_htf_ema        = input.bool(true, "Show HTF EMA", group = grp_quant, tooltip = "Displays higher timeframe EMA on the chart.")
+htf_tf              = input.string("15", "TF", options = ["15", "60", "240"], group = grp_quant, tooltip = "Higher timeframe for EMA: 15m, 1H, or 4H.")
+htf_ema_len         = input.int(50, "EMA Length", options = [50, 200], group = grp_quant, tooltip = "Higher timeframe EMA length.")
+col_htf_ema         = input.color(#2962ff, "EMA Color", group = grp_quant)
+htf_ema_width       = input.int(1, "EMA Width", minval = 1, maxval = 4, group = grp_quant)
+use_htf_level       = input.bool(true, "Use HTF Level Confluence", group = grp_quant, tooltip = "Enables Factor 6 — checks if extension target aligns with a key HTF structural level.")
+use_open_bias       = input.bool(true, "Open Bias Filter", group = grp_quant, tooltip = "Enables Factor 7 — considers opening gap direction relative to prior day's close.")
+use_liq_event       = input.bool(true, "Liquidity Event Detection", group = grp_quant, tooltip = "Enables Factor 8 — detects stop hunts / liquidity sweeps within the IB.")
+event_lookback      = input.int(20, "Event Lookback", minval = 5, maxval = 100, group = grp_quant, tooltip = "Lookback window for sweep detection (bars). Default is 20.")
+signal_decay        = input.int(100, "Signal Decay (bars)", minval = 5, maxval = 300, group = grp_quant, tooltip = "Maximum bars after a sweep for the liquidity event to remain active.")
+trend_lookback      = input.int(10, "Trend Lookback", minval = 3, maxval = 50, group = grp_quant, tooltip = "Lookback bars for market structure assessment (Factor 3).")
+imbalance_weight    = input.int(2, "Imbalance Weight", options = [1, 2, 3], group = grp_quant, tooltip = "Weight multiplier for Fair Value Gap pressure (Factor 5).")
+show_sweep_marks    = input.bool(true, "Show Sweep Markers", group = grp_quant, tooltip = "Plots arrows on IB bars where a local high/low was swept and reclaimed (Factor 8 events).")
+
+// --- C. EXTENSIONS & PROBABILITIES ---
+grp_ext             = "EXTENSIONS & PROBABILITIES"
+col_bull_ext        = input.color(#089981, "Bull Ext", group = grp_ext)
+col_bear_ext        = input.color(#f23645, "Bear Ext", group = grp_ext)
+ext_width           = input.int(1, "Width", minval = 1, maxval = 5, group = grp_ext)
+ext_style_str       = input.string("dotted", "Style", options = ["solid", "dashed", "dotted"], group = grp_ext)
+display_mode        = input.string("Short", "Display Mode", options = ["Short", "Long"], group = grp_ext, tooltip = "Short extends ~80 bars, Long extends ~200 bars.")
+show_hit_icons      = input.bool(true, "Show Hit Icons", group = grp_ext, tooltip = "Displays ✅ / ❌ icons when targets are hit.")
+col_bull_lbl        = input.color(#089981, "Bull Label", group = grp_ext)
+col_bear_lbl        = input.color(#f23645, "Bear Label", group = grp_ext)
+label_size_str      = input.string("normal", "Size", options = ["tiny", "small", "normal", "large"], group = grp_ext)
+
+// --- D. PREMIUM VISUALS & ALERTS ---
+grp_vis             = "PREMIUM VISUALS & ALERTS"
+show_heatmap        = input.bool(true, "Probability Heatmap", group = grp_vis, tooltip = "Fills IB box with a directional color gradient proportional to probability.")
+show_vol_zones      = input.bool(true, "Volatility Zones", group = grp_vis, tooltip = "Draws target reaction zones around 0.5x extensions.")
+col_bull_zone       = input.color(color.new(#089981, 90), "Bull Zone", group = grp_vis)
+col_bear_zone       = input.color(color.new(#f23645, 90), "Bear Zone", group = grp_vis)
+show_badge          = input.bool(true, "Confluence Badge", group = grp_vis, tooltip = "Shows the factor breakdown below the IB box.")
+show_context_lbl    = input.bool(true, "IB/ATR Context Label", group = grp_vis, tooltip = "Shows IB range, session average, and classification above the box.")
+strategy_alerts     = input.bool(true, "Strategy Alerts", group = grp_vis, tooltip = "Enables alerts on Edge detection and target hits.")
+
+// --- E. STATISTICS TABLE ---
+grp_tbl             = "STATISTICS TABLE"
+show_table          = input.bool(true, "Show Table", group = grp_tbl)
+table_theme         = input.string("Light", "Theme", options = ["Light", "Dark"], group = grp_tbl)
+edge_threshold      = input.float(70.0, "Edge Threshold %", minval = 51.0, maxval = 95.0, step = 1.0, group = grp_tbl, tooltip = "Minimum probability to qualify as an Edge setup.")
+table_size_str      = input.string("small", "Size", options = ["tiny", "small", "normal"], group = grp_tbl)
+table_pos_str       = input.string("top_right", "Position", options = ["top_right", "bottom_right", "top_left", "bottom_left"], group = grp_tbl)
+
+// --- F. HISTORY ---
+grp_hist            = "HISTORY"
+days_to_show        = input.int(15, "Days to Show", minval = 1, maxval = 50, group = grp_hist, tooltip = "How many past IB sessions are drawn on the chart.")
+
+// Resolution of Line Styles, Text Sizes, Lengths & Colors
+ext_line_style  = ext_style_str == "solid" ? line.style_solid : ext_style_str == "dashed" ? line.style_dashed : line.style_dotted
+lbl_size        = label_size_str == "tiny" ? size.tiny : label_size_str == "small" ? size.small : label_size_str == "large" ? size.large : size.normal
+ext_line_len    = display_mode == "Short" ? 80 : 200
+vol_zone_len    = display_mode == "Short" ? 50 : 120
+
+table_pos       = table_pos_str == "top_left" ? position.top_left : table_pos_str == "bottom_left" ? position.bottom_left : table_pos_str == "bottom_right" ? position.bottom_right : position.top_right
+table_text_size = table_size_str == "tiny" ? size.tiny : table_size_str == "normal" ? size.normal : size.small
+
+col_accum       = #ff9800
+col_neutral     = #787b86
+
+// Theme Color Palettes
+is_light = table_theme == "Light"
+
+// Table Palette
+c_tbl_bg        = is_light ? color.new(#ffffff, 0) : color.new(#131722, 10)
+c_tbl_border    = is_light ? color.new(#e0e3eb, 0) : color.new(#2a2e39, 40)
+c_tbl_frame     = is_light ? color.new(#d1d4dc, 0) : color.new(#2a2e39, 20)
+c_tbl_hdr_bg    = is_light ? color.new(#eef2f6, 0) : color.new(#2a2e39, 30)
+c_tbl_subhdr_bg = is_light ? color.new(#e8ecf8, 0) : color.new(#2a2e39, 60)
+c_tbl_hdr_txt   = is_light ? color.new(#131722, 0) : color.white
+c_tbl_sub_txt   = is_light ? color.new(#131722, 0) : color.new(color.white, 20)
+c_tbl_lbl_pri   = is_light ? color.new(#131722, 0) : color.white
+c_tbl_lbl_sec   = is_light ? color.new(#5d606b, 0) : color.gray
+c_tbl_val_txt   = is_light ? color.new(#131722, 0) : color.white
+
+// Label Palette
+c_lbl_bg        = is_light ? color.new(#ffffff, 0) : color.new(#1e222d, 15)
+c_lbl_txt       = is_light ? color.new(#131722, 0) : color.white
+c_ctx_bg        = is_light ? color.new(#eef2f6, 0) : color.new(#1e222d, 15)
+c_ctx_txt       = is_light ? color.new(#131722, 0) : color.white
+
+// =============================================================================
+// 2. NON-REPAINTING HIGHER TIMEFRAME FEEDS
+// =============================================================================
+
+// Non-repainting idiom: reference the last *completed* HTF bar ([1]) with lookahead_on, so historical
+// and realtime bars see the same value. (lookahead_off + [1] returns the bar two periods back on history.)
+
+// 1) HTF EMA (last completed HTF bar)
+htf_ema = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_ema_len)[1], barmerge.gaps_off, barmerge.lookahead_on)
+
+// 2) Prior Day High, Low, Midpoint and Close
+pdh = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], barmerge.gaps_off, barmerge.lookahead_on)
+pdc = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_off, barmerge.lookahead_on)
+pdm = (pdh + pdl) / 2.0
+
+// =============================================================================
+// 3. REAL-TIME FACTOR TRACKING ENGINES
+// =============================================================================
+
+// --- Parse Session End Hours & Minutes ---
+f_parse_session_end(string sess_str) =>
+    clean_sess = str.contains(sess_str, ":") ? array.get(str.split(sess_str, ":"), 0) : sess_str
+    parts = str.split(clean_sess, "-")
+    end_part = array.size(parts) > 1 ? array.get(parts, 1) : "1030"
+    end_h = math.floor(str.tonumber(str.substring(end_part, 0, 2)))
+    end_m = math.floor(str.tonumber(str.substring(end_part, 2, 4)))
+    [end_h, end_m]
+
+[sess_end_h, sess_end_m] = f_parse_session_end(ib_session)
+
+// --- Session Boundary Detection ---
+in_sess = not na(time(timeframe.period, ib_session, tz))
+is_sess_start = in_sess and not in_sess[1]
+
+// Precise determination of the final bar of the IB session
+next_bar_h = hour(time_close + 1000, tz)
+next_bar_m = minute(time_close + 1000, tz)
+is_exact_sess_close = in_sess and (next_bar_h == sess_end_h and next_bar_m == sess_end_m)
+is_fallback_sess_close = not in_sess and in_sess[1]
+
+// State to guarantee single execution per session
+var bool sess_evaluated = false
+if is_sess_start
+    sess_evaluated := false
+
+bool trigger_ib_close = false
+if is_exact_sess_close and not sess_evaluated
+    trigger_ib_close := true
+    sess_evaluated := true
+else if is_fallback_sess_close and not sess_evaluated
+    trigger_ib_close := true
+    sess_evaluated := true
+
+// --- Factor 1: Session VWAP Engine ---
+var float sess_pv = 0.0
+var float sess_vol = 0.0
+bar_vol = volume > 0 ? volume : 1.0
+
+if is_sess_start
+    sess_pv := hlc3 * bar_vol
+    sess_vol := bar_vol
+else if in_sess
+    sess_pv += hlc3 * bar_vol
+    sess_vol += bar_vol
+
+sess_vwap = sess_vol > 0 ? sess_pv / sess_vol : hlc3
+
+// --- Live Chart Plots for Session VWAP & HTF EMA ---
+plot(show_vwap ? sess_vwap : na, "VWAP", color = col_vwap, linewidth = 1)
+plot(show_htf_ema ? htf_ema : na, "HTF EMA", color = col_htf_ema, linewidth = htf_ema_width)
+
+// --- Factor 4: Order Flow Momentum (Cumulative Delta Proxy) ---
+candle_rng = (high - low) > 0 ? (high - low) : syminfo.mintick
+delta_proxy = ((close - open) / candle_rng) * bar_vol
+
+var float sess_cum_delta = 0.0
+if is_sess_start
+    sess_cum_delta := delta_proxy
+else if in_sess
+    sess_cum_delta += delta_proxy
+
+// --- Factor 5: Price Imbalance (Daily Fair Value Gaps) ---
+var float[] fvg_bull_top = array.new_float(0)
+var float[] fvg_bull_bot = array.new_float(0)
+var float[] fvg_bear_top = array.new_float(0)
+var float[] fvg_bear_bot = array.new_float(0)
+
+if is_sess_start
+    array.clear(fvg_bull_top)
+    array.clear(fvg_bull_bot)
+    array.clear(fvg_bear_top)
+    array.clear(fvg_bear_bot)
+
+// Bullish FVG: low > high[2]
+if low > high[2]
+    array.push(fvg_bull_top, low)
+    array.push(fvg_bull_bot, high[2])
+// Bearish FVG: high < low[2]
+if high < low[2]
+    array.push(fvg_bear_top, low[2])
+    array.push(fvg_bear_bot, high)
+
+// Invalidate mitigated FVGs to retain active unmitigated imbalances
+if array.size(fvg_bull_bot) > 0
+    for i = array.size(fvg_bull_bot) - 1 to 0
+        if low <= array.get(fvg_bull_bot, i)
+            array.remove(fvg_bull_top, i)
+            array.remove(fvg_bull_bot, i)
+
+if array.size(fvg_bear_top) > 0
+    for i = array.size(fvg_bear_top) - 1 to 0
+        if high >= array.get(fvg_bear_top, i)
+            array.remove(fvg_bear_top, i)
+            array.remove(fvg_bear_bot, i)
+
+// --- Factor 8: Liquidity Event Context (Sweep & Reclaim Engine) ---
+var float swing_ref_hi = na
+var float swing_ref_lo = na
+var int last_bull_sweep_bar = na
+var int last_bear_sweep_bar = na
+var int sess_bull_sweeps = 0
+var int sess_bear_sweeps = 0
+
+if is_sess_start
+    swing_ref_hi := high
+    swing_ref_lo := low
+    last_bull_sweep_bar := na
+    last_bear_sweep_bar := na
+    sess_bull_sweeps := 0
+    sess_bear_sweeps := 0
+
+// Track swing high and swing low of the lookback window before current bar
+local_p_hi = ta.highest(high, event_lookback)[1]
+local_p_lo = ta.lowest(low, event_lookback)[1]
+
+// Detect high sweep: price wicks above local high but closes back below it
+bool bear_sweep_reclaim = in_sess and (high > local_p_hi) and (close < local_p_hi) and (bar_index != last_bear_sweep_bar)
+// Detect low sweep: price wicks below local low but closes back above it
+bool bull_sweep_reclaim = in_sess and (low < local_p_lo) and (close > local_p_lo) and (bar_index != last_bull_sweep_bar)
+
+if bear_sweep_reclaim
+    last_bear_sweep_bar := bar_index
+    sess_bear_sweeps += 1
+
+if bull_sweep_reclaim
+    last_bull_sweep_bar := bar_index
+    sess_bull_sweeps += 1
+
+// Render institutional sweep arrows inside the IB
+plotshape(show_sweep_marks and bear_sweep_reclaim, "Liquidity High Sweep Reclaim", shape.arrowdown, location.abovebar, color = color.new(col_bear_ext, 0), size = size.small)
+plotshape(show_sweep_marks and bull_sweep_reclaim, "Liquidity Low Sweep Reclaim", shape.arrowup, location.belowbar, color = color.new(#2962ff, 0), size = size.small)
+
+// --- Factor 3: Market Trend State inputs (must run on every bar, not inside the IB-close block) ---
+trend_half_lb = math.max(1, int(math.floor(trend_lookback / 2)))
+trend_h_prior = ta.highest(high, trend_half_lb)[trend_half_lb]
+trend_h_recent = ta.highest(high, trend_half_lb)
+trend_l_prior = ta.lowest(low, trend_half_lb)[trend_half_lb]
+trend_l_recent = ta.lowest(low, trend_half_lb)
+
+// =============================================================================
+// 4. INITIAL BALANCE (IB) AGGREGATION & STORAGE
+// =============================================================================
+
+var float ib_high = na
+var float ib_low = na
+var float ib_open_price = na
+var int ib_start_time = na
+var float prev_sess_close = na
+var bool ib_started = false  // false until a session start is seen on the chart (skips a partial first IB)
+
+// Historical IB ranges array strictly for this session window
+var float[] ib_history_array = array.new_float(0)
+
+// Active tracking session state
+var bool session_tracking = false
+var float active_primary_target = na
+var float active_counter_target = na
+var string active_bias = ""
+var bool active_is_edge = false
+var float active_primary_prob = 0.0
+var int active_confluence = 0
+
+// Statistics Counters
+var int stat_total_setups = 0
+var int stat_total_wins = 0
+var int stat_total_losses = 0
+var int stat_edge_setups = 0
+var int stat_edge_wins = 0
+var int stat_edge_losses = 0
+var string stat_last_bias_str = "None"
+var int stat_last_conf = 0
+
+// Chart objects grouped per IB session so "Days to Show" removes whole sessions
+type SessionDrawings
+    array<box>   boxes
+    array<line>  lines
+    array<label> labels
+
+var array<SessionDrawings> session_drawings = array.new<SessionDrawings>()
+
+var box active_ib_box = na
+var label active_ib_lbl = na
+
+f_manage_drawings(int max_days) =>
+    while array.size(session_drawings) > max_days
+        SessionDrawings old_grp = array.shift(session_drawings)
+        for b in old_grp.boxes
+            box.delete(b)
+        for l in old_grp.lines
+            line.delete(l)
+        for lb in old_grp.labels
+            label.delete(lb)
+
+// Attaches a hit icon to the most recent session's drawing group
+f_attach_label(label lb) =>
+    if array.size(session_drawings) > 0
+        SessionDrawings last_grp = array.last(session_drawings)
+        array.push(last_grp.labels, lb)
+
+// Session Bar Range Tracking
+if is_sess_start
+    ib_high := high
+    ib_low := low
+    ib_open_price := open
+    ib_start_time := time
+    prev_sess_close := pdc
+    ib_started := true
+    active_ib_box := box.new(left=time, top=ib_high, right=time, bottom=ib_low, xloc=xloc.bar_time, bgcolor=color.new(color.blue, 95), border_color=color.new(color.blue, 50))
+    active_ib_lbl := label.new(x=time, y=ib_high, text="IB building...", xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_down, color=color.new(color.white, 100), textcolor=color.gray, size=size.small)
+else if in_sess
+    ib_high := math.max(ib_high, high)
+    ib_low := math.min(ib_low, low)
+
+if in_sess
+    if not na(active_ib_box)
+        box.set_top(active_ib_box, ib_high)
+        box.set_bottom(active_ib_box, ib_low)
+        box.set_right(active_ib_box, time)
+    if not na(active_ib_lbl)
+        int mid_time = math.round((ib_start_time + time) / 2)
+        label.set_xy(active_ib_lbl, mid_time, ib_high)
+
+// =============================================================================
+// 5. SESSION CLOSE: CLASSIFICATION & 8-FACTOR PROBABILITY ENGINE
+// =============================================================================
+
+if trigger_ib_close and ib_started and not na(ib_high) and not na(ib_low)
+    if not na(active_ib_box)
+        box.delete(active_ib_box)
+        active_ib_box := na
+    if not na(active_ib_lbl)
+        label.delete(active_ib_lbl)
+        active_ib_lbl := na
+        
+    ib_range = ib_high - ib_low
+    ib_mid = (ib_high + ib_low) / 2.0
+    
+    // --- 1. Session Classification ---
+    avg_ib = array.size(ib_history_array) > 0 ? array.avg(ib_history_array) : ib_range
+    hist_size = array.size(ib_history_array)
+    
+    string class_label = "BUILDING HISTORY..."
+    bool is_accum = false
+    bool is_expanded = false
+    
+    if hist_size >= 3
+        if ib_range < avg_ib * 0.70
+            class_label := "ACCUMULATION 🔶"
+            is_accum := true
+        else if ib_range > avg_ib * 1.40
+            class_label := "EXPANDED ⚠"
+            is_expanded := true
+        else
+            class_label := "NORMAL ◆"
+    
+    // Store completed range into history array (retaining up to 50 sessions)
+    array.push(ib_history_array, ib_range)
+    if array.size(ib_history_array) > 50
+        array.shift(ib_history_array)
+    
+    // --- 2. Evaluate 8 Quant Factors ---
+    
+    // Factor 1: Price vs Session VWAP
+    f1_vote = close > sess_vwap ? 1 : close < sess_vwap ? -1 : 0
+    
+    // Factor 2: HTF EMA Bias
+    f2_vote = close > htf_ema ? 1 : close < htf_ema ? -1 : 0
+    
+    // Factor 3: Market Trend State (Higher Highs & Higher Lows vs Lower Highs & Lower Lows)
+    trend_bull = (trend_h_recent > trend_h_prior) and (trend_l_recent >= trend_l_prior)
+    trend_bear = (trend_h_recent <= trend_h_prior) and (trend_l_recent < trend_l_prior)
+    f3_vote = trend_bull ? 1 : trend_bear ? -1 : (close > close[trend_lookback] ? 1 : -1)
+    
+    // Factor 4: Order Flow Momentum
+    f4_vote = sess_cum_delta > 0 ? 1 : sess_cum_delta < 0 ? -1 : 0
+    
+    // Factor 5: Price Imbalance Pressure (Unfilled FVGs)
+    unmit_bull_count = 0
+    unmit_bear_count = 0
+    if array.size(fvg_bull_top) > 0
+        for i = 0 to array.size(fvg_bull_top) - 1
+            if array.get(fvg_bull_top, i) < close
+                unmit_bull_count += 1
+    if array.size(fvg_bear_bot) > 0
+        for i = 0 to array.size(fvg_bear_bot) - 1
+            if array.get(fvg_bear_bot, i) > close
+                unmit_bear_count += 1
+    f5_vote = unmit_bull_count > unmit_bear_count ? 1 : unmit_bear_count > unmit_bull_count ? -1 : 0
+    
+    // Factor 6: HTF Structural Level Proximity
+    proj_bull_ext = ib_high + (ib_range * 0.5)
+    proj_bear_ext = ib_low - (ib_range * 0.5)
+    
+    // Must be within a meaningful proximity threshold to count as level confluence
+    htf_proximity_threshold = ib_range * 0.35
+    dist_bull = math.min(math.abs(proj_bull_ext - pdh), math.abs(proj_bull_ext - pdm), math.abs(proj_bull_ext - pdl))
+    dist_bear = math.min(math.abs(proj_bear_ext - pdh), math.abs(proj_bear_ext - pdm), math.abs(proj_bear_ext - pdl))
+    bull_near_htf = dist_bull <= htf_proximity_threshold
+    bear_near_htf = dist_bear <= htf_proximity_threshold
+    
+    f6_vote = use_htf_level ? (bull_near_htf and not bear_near_htf ? 1 : bear_near_htf and not bull_near_htf ? -1 : 0) : 0
+    
+    // Factor 7: Opening Bias
+    f7_vote = use_open_bias and not na(prev_sess_close) ? (ib_open_price > prev_sess_close ? 1 : ib_open_price < prev_sess_close ? -1 : 0) : 0
+    
+    // Factor 8: Liquidity Event Context
+    f8_vote = 0
+    if use_liq_event
+        has_bull_sweep = not na(last_bull_sweep_bar) and (bar_index - last_bull_sweep_bar <= signal_decay)
+        has_bear_sweep = not na(last_bear_sweep_bar) and (bar_index - last_bear_sweep_bar <= signal_decay)
+        
+        // If price broke down and closed below midpoint, sweeps of the high dominate as institutional stop runs
+        if has_bear_sweep and close < ib_mid
+            f8_vote := -1
+        else if has_bull_sweep and close > ib_mid
+            f8_vote := 1
+        else if has_bear_sweep and not has_bull_sweep
+            f8_vote := -1
+        else if has_bull_sweep and not has_bear_sweep
+            f8_vote := 1
+    
+    // --- 3. Weighted Probability Normalization ---
+    w1 = 1.0
+    w2 = 1.0
+    w3 = 1.0
+    w4 = 1.0
+    w5 = float(imbalance_weight)
+    w6 = use_htf_level ? 1.0 : 0.0
+    w7 = use_open_bias ? 1.0 : 0.0
+    w8 = use_liq_event ? 1.0 : 0.0
+    
+    w_total = w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8
+    
+    float bull_score = 0.0
+    bull_score += f1_vote == 1 ? w1 : (f1_vote == 0 ? 0.5 * w1 : 0.0)
+    bull_score += f2_vote == 1 ? w2 : (f2_vote == 0 ? 0.5 * w2 : 0.0)
+    bull_score += f3_vote == 1 ? w3 : (f3_vote == 0 ? 0.5 * w3 : 0.0)
+    bull_score += f4_vote == 1 ? w4 : (f4_vote == 0 ? 0.5 * w4 : 0.0)
+    bull_score += f5_vote == 1 ? w5 : (f5_vote == 0 ? 0.5 * w5 : 0.0)
+    if use_htf_level
+        bull_score += f6_vote == 1 ? w6 : (f6_vote == 0 ? 0.5 * w6 : 0.0)
+    if use_open_bias
+        bull_score += f7_vote == 1 ? w7 : (f7_vote == 0 ? 0.5 * w7 : 0.0)
+    if use_liq_event
+        bull_score += f8_vote == 1 ? w8 : (f8_vote == 0 ? 0.5 * w8 : 0.0)
+    
+    float bear_score = w_total - bull_score
+    
+    // Direction and Base Probability
+    string bias = bear_score > bull_score ? "BEAR" : "BULL"
+    float win_score = bias == "BEAR" ? bear_score : bull_score
+    float loss_score = bias == "BEAR" ? bull_score : bear_score
+    
+    // Normalized directional spread [0.0 to 1.0]
+    float net_spread = w_total > 0 ? (win_score - loss_score) / w_total : 0.0
+    
+    // Mathematical mapping from weighted factor spread to institutional probability:
+    // - Neutral (net_spread = 0.0, 50/50 balance) -> 50%
+    // - Moderate confluence (net_spread ~0.25 to ~0.50) -> ~61% to ~73%
+    // - Strong confluence (net_spread ~0.50 to ~0.75) -> ~73% to ~85%
+    // - Maximum / Unanimous confluence (net_spread ~0.85 to 1.00) -> ~90% to 95%
+    // Formula: Base 50% + linear scaling (43.0 * spread) + gentle convex booster (2.0 * spread^2)
+    float raw_prob = 50.0 + (net_spread * 43.0) + (math.pow(net_spread, 2) * 2.0)
+    float primary_prob = math.min(95.0, math.max(50.0, math.round(raw_prob)))
+    float counter_prob = 100.0 - primary_prob
+    
+    // --- 4. Confluence Scoring ---
+    target_vote = bias == "BULL" ? 1 : -1
+    int confluence = 0
+    confluence += f1_vote == target_vote ? 1 : 0
+    confluence += f2_vote == target_vote ? 1 : 0
+    confluence += f3_vote == target_vote ? 1 : 0
+    confluence += f4_vote == target_vote ? 1 : 0
+    confluence += f5_vote == target_vote ? 1 : 0
+    if use_htf_level and f6_vote == target_vote
+        confluence += 1
+    if use_open_bias and f7_vote == target_vote
+        confluence += 1
+    if use_liq_event and f8_vote == target_vote
+        confluence += 1
+    
+    total_active_factors = 5 + (use_htf_level ? 1 : 0) + (use_open_bias ? 1 : 0) + (use_liq_event ? 1 : 0)
+    is_edge = primary_prob >= edge_threshold
+    
+    // Update Dashboard Memory
+    stat_last_bias_str := (bias == "BULL" ? "▲ BULL  " : "▼ BEAR  ") + str.tostring(primary_prob, "#") + "%"
+    stat_last_conf := confluence
+    
+    // Arm Real-time Hit Tracker for Subsequent Bars
+    session_tracking := true
+    active_bias := bias
+    active_primary_prob := primary_prob
+    active_is_edge := is_edge
+    active_confluence := confluence
+    
+    if bias == "BULL"
+        active_primary_target := proj_bull_ext
+        active_counter_target := proj_bear_ext
+    else
+        active_primary_target := proj_bear_ext
+        active_counter_target := proj_bull_ext
+    
+    // =========================================================================
+    // 6. CHART DRAWINGS & VISUAL RENDERING
+    // =========================================================================
+    
+    SessionDrawings grp = SessionDrawings.new(array.new_box(), array.new_line(), array.new_label())
+    array.push(session_drawings, grp)
+
+    // 1) IB Box & Midpoint
+    color fill_color = ib_bg_color
+    if show_heatmap
+        int alpha_val = math.max(85, math.min(96, int(96 - (primary_prob - 50.0) * 0.22)))
+        fill_color := bias == "BULL" ? color.new(col_bull_ext, alpha_val) : color.new(col_bear_ext, alpha_val)
+    
+    color border_color = is_accum ? col_accum : (is_edge and highlight_edge ? (bias == "BULL" ? col_bull_ext : col_bear_ext) : ib_border_color)
+    int border_w = is_accum ? 2 : (is_edge and highlight_edge ? edge_border_width : 1)
+    
+    b_ib = box.new(left = ib_start_time, top = ib_high, right = time, bottom = ib_low,
+                   xloc = xloc.bar_time, bgcolor = fill_color, border_color = border_color, border_width = border_w)
+    array.push(grp.boxes, b_ib)
+    
+    l_mid = line.new(x1 = ib_start_time, y1 = ib_mid, x2 = time, y2 = ib_mid,
+                     xloc = xloc.bar_time, color = color.new(color.gray, 40), style = line.style_dashed, width = 1)
+    array.push(grp.lines, l_mid)
+    
+    // 2) Top Context Label
+    int mid_time = math.round((ib_start_time + time) / 2)
+    if show_context_lbl
+        string txt_context = "IB: " + str.tostring(ib_range, "#.#") + "pt | Avg: " + str.tostring(avg_ib, "#") + "pt | " + class_label
+        lbl_context = label.new(x = mid_time, y = ib_high, text = txt_context,
+                                 xloc = xloc.bar_time, yloc = yloc.price,
+                                 color = c_ctx_bg, textcolor = c_ctx_txt,
+                                 style = label.style_label_down, size = size.small)
+        array.push(grp.labels, lbl_context)
+    
+    // 3) Bottom Confluence Badge (Two-Column Layout matching Herman reference)
+    if show_badge
+        string v_vwap  = (f1_vote == target_vote ? "✓" : "✕") + " VWAP"
+        string v_ema   = (f2_vote == target_vote ? "✓" : "✕") + " EMA"
+        string v_trend = (f3_vote == target_vote ? "✓" : "✕") + " Trend"
+        string v_flow  = (f4_vote == target_vote ? "✓" : "✕") + " Flow"
+        string v_imbal = (f5_vote == target_vote ? "✓" : "✕") + " Imbalance"
+        string v_liq   = (not use_liq_event ? "–" : f8_vote == target_vote ? "✓" : "✕") + " Liq."
+        string v_htf   = (not use_htf_level ? "–" : f6_vote == target_vote ? "✓" : "✕") + " HTF Lvl"
+        string v_open  = (not use_open_bias ? "–" : f7_vote == target_vote ? "✓" : "✕") + " Open"
+        
+        string badge_header = (bias == "BULL" ? "▲ BULL " : "▼ BEAR ") + str.tostring(primary_prob, "#") + "%"
+        string row1 = v_vwap + "      " + v_ema
+        string row2 = v_trend + "      " + v_flow
+        string row3 = v_imbal + "  " + v_liq
+        string row4 = v_htf + "    " + v_open
+        string row5 = "Confluence: " + str.tostring(confluence) + " / " + str.tostring(total_active_factors)
+        string txt_badge = badge_header + "\n" + row1 + "\n" + row2 + "\n" + row3 + "\n" + row4 + "\n" + row5
+        
+        lbl_badge = label.new(x = mid_time, y = ib_low, text = txt_badge,
+                              xloc = xloc.bar_time, yloc = yloc.price,
+                              color = c_lbl_bg, textcolor = c_lbl_txt,
+                              style = label.style_label_up, size = size.small)
+        array.push(grp.labels, lbl_badge)
+    
+    // 4) Targets, Volatility Zones & Projection Lines
+    bar_dur = (time - time[1]) > 0 ? (time - time[1]) : 60000
+    int line_end_time = time + (bar_dur * ext_line_len)
+    int zone_end_time = time + (bar_dur * vol_zone_len)
+    
+    color bull_col = primary_prob < 60.0 ? col_neutral : col_bull_ext
+    color bear_col = primary_prob < 60.0 ? col_neutral : col_bear_ext
+    
+    float primary_price = active_primary_target
+    float counter_price = active_counter_target
+    color primary_col = bias == "BULL" ? bull_col : bear_col
+    color counter_col = bias == "BULL" ? bear_col : bull_col
+    
+    // Extension Lines
+    l_pri = line.new(x1 = time, y1 = primary_price, x2 = line_end_time, y2 = primary_price,
+                     xloc = xloc.bar_time, color = primary_col, style = ext_line_style, width = ext_width)
+    array.push(grp.lines, l_pri)
+    
+    l_cnt = line.new(x1 = time, y1 = counter_price, x2 = line_end_time, y2 = counter_price,
+                     xloc = xloc.bar_time, color = counter_col, style = ext_line_style, width = ext_width)
+    array.push(grp.lines, l_cnt)
+    
+    // Volatility Reaction Zones
+    if show_vol_zones
+        float vol_pad = ib_range * 0.05
+        color pri_zone_bg = bias == "BULL" ? col_bull_zone : col_bear_zone
+        color cnt_zone_bg = bias == "BULL" ? col_bear_zone : col_bull_zone
+        
+        b_pri_vol = box.new(left = time, top = primary_price + vol_pad, right = zone_end_time, bottom = primary_price - vol_pad,
+                              xloc = xloc.bar_time, bgcolor = pri_zone_bg, border_color = primary_col, border_width = 1)
+        array.push(grp.boxes, b_pri_vol)
+        
+        b_cnt_vol = box.new(left = time, top = counter_price + vol_pad, right = zone_end_time, bottom = counter_price - vol_pad,
+                              xloc = xloc.bar_time, bgcolor = cnt_zone_bg, border_color = counter_col, border_width = 1)
+        array.push(grp.boxes, b_cnt_vol)
+    
+    // Extension Probability Floating Labels
+    string pri_prefix = is_edge ? "⚡ " : ""
+    int lbl_pos_time = line_end_time + (bar_dur * 10)
+    color pri_lbl_color = primary_prob < 60.0 ? col_neutral : (bias == "BULL" ? col_bull_lbl : col_bear_lbl)
+    color cnt_lbl_color = primary_prob < 60.0 ? col_neutral : (bias == "BULL" ? col_bear_lbl : col_bull_lbl)
+    
+    lbl_pri = label.new(x = lbl_pos_time, y = primary_price, text = pri_prefix + str.tostring(primary_prob, "#") + "%",
+                          xloc = xloc.bar_time, yloc = yloc.price,
+                          color = color.new(color.white, 100), textcolor = pri_lbl_color,
+                          style = label.style_none, size = lbl_size)
+    array.push(grp.labels, lbl_pri)
+    
+    lbl_cnt = label.new(x = lbl_pos_time, y = counter_price, text = str.tostring(counter_prob, "#") + "%",
+                          xloc = xloc.bar_time, yloc = yloc.price,
+                          color = color.new(color.white, 100), textcolor = cnt_lbl_color,
+                          style = label.style_none, size = lbl_size)
+    array.push(grp.labels, lbl_cnt)
+    
+    // Prune drawings to maintain buffer limits
+    f_manage_drawings(days_to_show)
+    
+    // Edge Alert
+    if is_edge and strategy_alerts
+        alert("Edge Setup Detected: " + bias + " " + str.tostring(primary_prob, "#") + "% | Confluence: " + str.tostring(confluence) + "/" + str.tostring(total_active_factors), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 7. SUBSEQUENT BAR HIT DETECTION ENGINE
+// =============================================================================
+
+if session_tracking and not in_sess
+    bool hit_primary = false
+    bool hit_counter = false
+    
+    if active_bias == "BULL"
+        hit_primary := high >= active_primary_target
+        hit_counter := low <= active_counter_target
+    else
+        hit_primary := low <= active_primary_target
+        hit_counter := high >= active_counter_target
+    
+    if hit_primary and not hit_counter
+        // WIN EVENT
+        stat_total_setups += 1
+        stat_total_wins += 1
+        if active_is_edge
+            stat_edge_setups += 1
+            stat_edge_wins += 1
+        
+        if show_hit_icons
+            lbl_hit = label.new(x = time, y = active_primary_target, text = "✅",
+                                  xloc = xloc.bar_time, yloc = yloc.price,
+                                  color = color.new(color.white, 100), textcolor = col_bull_ext,
+                                  style = label.style_none, size = lbl_size)
+            f_attach_label(lbl_hit)
+            
+        session_tracking := false
+        if strategy_alerts
+            alert("IB Target Hit: Win (" + active_bias + ") | Wins: " + str.tostring(stat_total_wins) + "/" + str.tostring(stat_total_setups), alert.freq_once_per_bar)
+        
+    else if hit_counter and not hit_primary
+        // LOSS EVENT
+        stat_total_setups += 1
+        stat_total_losses += 1
+        if active_is_edge
+            stat_edge_setups += 1
+            stat_edge_losses += 1
+        
+        if show_hit_icons
+            lbl_miss = label.new(x = time, y = active_counter_target, text = "❌",
+                                 xloc = xloc.bar_time, yloc = yloc.price,
+                                 color = color.new(color.white, 100), textcolor = col_bear_ext,
+                                 style = label.style_none, size = lbl_size)
+            f_attach_label(lbl_miss)
+            
+        session_tracking := false
+        if strategy_alerts
+            alert("IB Target Hit: Loss (" + active_bias + ")", alert.freq_once_per_bar)
+        
+    else if hit_primary and hit_counter
+        // High-volatility simultaneous touch bar: evaluate close relative to IB
+        bool won = active_bias == "BULL" ? close >= (ib_high + ib_low) / 2.0 : close <= (ib_high + ib_low) / 2.0
+        stat_total_setups += 1
+        if won
+            stat_total_wins += 1
+            if active_is_edge
+                stat_edge_setups += 1
+                stat_edge_wins += 1
+            if show_hit_icons
+                lbl_hit = label.new(x = time, y = active_primary_target, text = "✅",
+                                      xloc = xloc.bar_time, yloc = yloc.price,
+                                      color = color.new(color.white, 100), textcolor = col_bull_ext,
+                                      style = label.style_none, size = lbl_size)
+                f_attach_label(lbl_hit)
+            if strategy_alerts
+                alert("IB Target Hit: Win (" + active_bias + ") | Wins: " + str.tostring(stat_total_wins) + "/" + str.tostring(stat_total_setups), alert.freq_once_per_bar)
+        else
+            stat_total_losses += 1
+            if active_is_edge
+                stat_edge_setups += 1
+                stat_edge_losses += 1
+            if show_hit_icons
+                lbl_miss = label.new(x = time, y = active_counter_target, text = "❌",
+                                     xloc = xloc.bar_time, yloc = yloc.price,
+                                     color = color.new(color.white, 100), textcolor = col_bear_ext,
+                                     style = label.style_none, size = lbl_size)
+                f_attach_label(lbl_miss)
+            if strategy_alerts
+                alert("IB Target Hit: Loss (" + active_bias + ")", alert.freq_once_per_bar)
+        session_tracking := false
+
+// =============================================================================
+// 8. PERSISTENT PERFORMANCE DASHBOARD TABLE
+// =============================================================================
+
+f_render_bar(int rate) =>
+    clamped = math.max(0, math.min(100, rate))
+    filled = math.round(clamped / 10.0)
+    empty = 10 - filled
+    str.repeat("■", int(filled)) + str.repeat("□", int(empty)) + "  " + str.tostring(rate) + "%"
+
+var table dash = table.new(table_pos, 2, 14,
+                           bgcolor = c_tbl_bg,
+                           border_color = c_tbl_border,
+                           border_width = 1,
+                           frame_color = c_tbl_frame,
+                           frame_width = 1)
+
+if show_table and barstate.islast
+    // Calculate Win Rates
+    gen_hit_rate = stat_total_setups > 0 ? math.round((stat_total_wins / float(stat_total_setups)) * 100.0) : 0
+    edge_hit_rate = stat_edge_setups > 0 ? math.round((stat_edge_wins / float(stat_edge_setups)) * 100.0) : 0
+    
+    // Header
+    table.cell(dash, 0, 0, "IB Probability Map  [Herman]", bgcolor = c_tbl_hdr_bg, text_color = c_tbl_hdr_txt, text_size = table_text_size)
+    table.cell(dash, 1, 0, "", bgcolor = c_tbl_hdr_bg, text_size = table_text_size)
+    table.merge_cells(dash, 0, 0, 1, 0)
+    
+    // Row 1: General Hit Rate
+    table.cell(dash, 0, 1, "General Hit Rate", text_color = c_tbl_lbl_pri, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 1, stat_total_setups > 0 ? f_render_bar(int(gen_hit_rate)) : "□□□□□□□□□□  0%", text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 2: Setups [ W / L ]
+    table.cell(dash, 0, 2, "Setups [ W / L ]", text_color = c_tbl_lbl_pri, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 2, str.tostring(stat_total_setups) + "  [ " + str.tostring(stat_total_wins) + " / " + str.tostring(stat_total_losses) + " ]", text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 3: Edge Mode Subheader
+    table.cell(dash, 0, 3, "Edge Mode  ≥" + str.tostring(edge_threshold, "#") + "%", bgcolor = c_tbl_subhdr_bg, text_color = c_tbl_sub_txt, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 3, "", bgcolor = c_tbl_subhdr_bg, text_size = table_text_size)
+    table.merge_cells(dash, 0, 3, 1, 3)
+    
+    // Row 4: Edge Hit Rate
+    table.cell(dash, 0, 4, "Edge Hit Rate", text_color = c_tbl_lbl_pri, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 4, stat_edge_setups > 0 ? f_render_bar(int(edge_hit_rate)) : "□□□□□□□□□□  0%", text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 5: Edge [ W / L ]
+    table.cell(dash, 0, 5, "Edge [ W / L ]", text_color = c_tbl_lbl_pri, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 5, str.tostring(stat_edge_setups) + "  [ " + str.tostring(stat_edge_wins) + " / " + str.tostring(stat_edge_losses) + " ]", text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 6: Session Info Subheader
+    table.cell(dash, 0, 6, "Session Info", bgcolor = c_tbl_subhdr_bg, text_color = c_tbl_sub_txt, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 6, "", bgcolor = c_tbl_subhdr_bg, text_size = table_text_size)
+    table.merge_cells(dash, 0, 6, 1, 6)
+    
+    // Row 7: IB Time
+    string sess_display = str.contains(ib_session, ":") ? array.get(str.split(ib_session, ":"), 0) : ib_session
+    table.cell(dash, 0, 7, "IB Time", text_color = c_tbl_lbl_sec, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 7, sess_display, text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 8: Chart TF
+    table.cell(dash, 0, 8, "Chart TF", text_color = c_tbl_lbl_sec, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 8, timeframe.period, text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 9: Last Bias
+    color bias_col = str.contains(stat_last_bias_str, "BULL") ? col_bull_ext : str.contains(stat_last_bias_str, "BEAR") ? col_bear_ext : col_neutral
+    table.cell(dash, 0, 9, "Last Bias", text_color = c_tbl_lbl_sec, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 9, stat_last_bias_str, text_color = bias_col, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 10: Confluence
+    int tot_f = 5 + (use_htf_level ? 1 : 0) + (use_open_bias ? 1 : 0) + (use_liq_event ? 1 : 0)
+    table.cell(dash, 0, 10, "Confluence", text_color = c_tbl_lbl_sec, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 10, str.tostring(stat_last_conf) + " / " + str.tostring(tot_f), text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 11: Trend Filter
+    table.cell(dash, 0, 11, "Trend Filter", text_color = c_tbl_lbl_sec, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 11, (htf_tf == "15" ? "15m" : htf_tf == "60" ? "1H" : "4H") + " / EMA" + str.tostring(htf_ema_len), text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 12: Filters (HTF/Open/Liq)
+    string flt_htf = use_htf_level ? "✅" : "❌"
+    string flt_opn = use_open_bias ? "✅" : "❌"
+    string flt_liq = use_liq_event ? "✅" : "❌"
+    table.cell(dash, 0, 12, "Filters (HTF/Open/Liq)", text_color = c_tbl_lbl_sec, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 12, flt_htf + " / " + flt_opn + " / " + flt_liq, text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)
+    
+    // Row 13: Matrix (LB/Dec/Tr/W)
+    string matrix_str = str.tostring(event_lookback) + " / " + str.tostring(signal_decay) + " / " + str.tostring(trend_lookback) + " / " + str.tostring(imbalance_weight)
+    table.cell(dash, 0, 13, "Matrix (LB/Dec/Tr/W)", text_color = c_tbl_lbl_sec, text_size = table_text_size, text_halign = text.align_left)
+    table.cell(dash, 1, 13, matrix_str, text_color = c_tbl_val_txt, text_size = table_text_size, text_halign = text.align_right)

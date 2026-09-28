@@ -1,0 +1,472 @@
+//@version=6
+indicator("CISD Engine & FVG/iFVG [Herman]", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+// =============================================================================
+// 1. USER INPUTS & CONFIGURATION
+// =============================================================================
+
+// --- A. CISD Engine (Change in State of Delivery) Settings ---
+grp_cisd                = "CISD Engine (Change in State of Delivery)"
+show_cisd               = input.bool(true, "Enable CISD Engine", group = grp_cisd)
+pullback_conviction_pct = input.int(20, "Pullback Candle Conviction %", minval = 0, maxval = 100, step = 5, group = grp_cisd, tooltip = "Minimum body-to-range ratio percentage [abs(close - open) / (high - low) * 100] required to qualify as a valid pullback candle, filtering out weak dojis.")
+disp_atr_mult           = input.float(0.75, "Displacement ATR Multiplier", minval = 0.0, maxval = 3.0, step = 0.25, group = grp_cisd, tooltip = "Displacement confirmation candle body must be >= disp_atr_mult * ATR(14). Set to 0 to disable ATR filter.")
+cisd_ext_bars           = input.int(5, "Active CISD Extension (Bars)", minval = 1, maxval = 200, group = grp_cisd, tooltip = "Forward projection length for the currently active CISD delivery level.")
+keep_old_cisd_levels    = input.bool(false, "Keep old CISD levels", group = grp_cisd, tooltip = "When disabled, superseded levels are removed when a new shift occurs. When enabled, historical levels remain visible.")
+max_cisd_lines          = input.int(10, "Max Active CISD Lines to Retain", minval = 1, maxval = 50, group = grp_cisd)
+col_bull_cisd           = input.color(#089981, "+CISD Bullish Color", group = grp_cisd)
+col_bear_cisd           = input.color(#f23645, "-CISD Bearish Color", group = grp_cisd)
+cisd_line_width         = input.int(1, "CISD Line Width", minval = 1, maxval = 4, group = grp_cisd)
+cisd_line_style_str     = input.string("Solid", "CISD Line Style", options = ["Solid", "Dotted", "Dashed"], group = grp_cisd)
+show_cisd_labels        = input.bool(true, "Show CISD Labels (+CISD / -CISD)", group = grp_cisd)
+
+// --- B. Fair Value Gap (FVG) & Inverted FVG (iFVG) Settings ---
+grp_fvg                 = "Fair Value Gap (FVG) & Inverted FVG (iFVG)"
+show_ifvg               = input.bool(true, "Mark iFVG", group = grp_fvg)
+show_fvg                = input.bool(true, "Mark FVG", group = grp_fvg)
+fvg_size_unit           = input.string("Ticks", "FVG Size Unit", options = ["Ticks", "Points"], group = grp_fvg, tooltip = "Unit of measurement for minimum FVG and iFVG/BPR sizes.")
+min_fvg_size            = input.float(0.0, "Minimum FVG size", minval = 0.0, step = 0.5, group = grp_fvg, tooltip = "Minimum gap height in selected units. Default 0 detects all pure 3-candle imbalances.")
+min_ifvg_size           = input.float(0.0, "Minimum iFVG/BPR size", minval = 0.0, step = 0.5, group = grp_fvg, tooltip = "Minimum gap height for inverted FVGs in selected units.")
+col_bull_fvg            = input.color(color.new(#089981, 85), "FVG Bullish Color", group = grp_fvg)
+col_bear_fvg            = input.color(color.new(#f23645, 85), "FVG Bearish Color", group = grp_fvg)
+col_bull_ifvg           = input.color(color.new(#089981, 75), "IFVG Bullish Color", group = grp_fvg)
+col_bear_ifvg           = input.color(color.new(#f23645, 75), "IFVG Bearish Color", group = grp_fvg)
+show_borders            = input.bool(true, "Borders", group = grp_fvg)
+show_bg                 = input.bool(true, "Background", group = grp_fvg)
+extend_fvg_boxes        = input.int(1, "Extend boxes", minval = 0, maxval = 50, group = grp_fvg, tooltip = "Number of forward bars to extend newly formed FVG boxes.")
+no_labels               = input.bool(true, "No labels?", group = grp_fvg, tooltip = "Hide text labels inside boxes for clean institutional display.")
+max_fvg_boxes           = input.int(3, "Max FVGs to Display", minval = 1, maxval = 50, group = grp_fvg)
+max_ifvg_boxes          = input.int(1, "Max iFVGs to Display", minval = 1, maxval = 50, group = grp_fvg)
+
+// Resolve Line Style
+line_style_choice       = cisd_line_style_str == "Dotted" ? line.style_dotted : cisd_line_style_str == "Dashed" ? line.style_dashed : line.style_solid
+
+// Volatility Baseline
+atr14                   = ta.atr(14)
+
+// CISD Pullback Conviction Fraction
+conviction_fraction     = pullback_conviction_pct / 100.0
+
+// FVG & iFVG Configuration & Thresholds
+min_fvg_pts             = fvg_size_unit == "Ticks" ? min_fvg_size * syminfo.mintick : min_fvg_size
+min_ifvg_pts            = fvg_size_unit == "Ticks" ? min_ifvg_size * syminfo.mintick : min_ifvg_size
+show_fvg_labels         = not no_labels
+show_ifvg_labels        = not no_labels
+
+// =============================================================================
+// 2. USER-DEFINED TYPES (UDTs) & DRAWING MANAGEMENT
+// =============================================================================
+
+type CISDLevel
+    line  lvl_line
+    label lvl_label
+    float price
+    int   direction   // +1 Bullish, -1 Bearish
+    int   start_bar
+    bool  active
+
+type FVGZone
+    box   zone_box
+    label zone_label
+    float top
+    float bottom
+    int   direction   // +1 Bullish (demand), -1 Bearish (supply)
+    int   start_bar
+    bool  is_inverted
+    bool  mitigated
+
+// Memory Tracking Ring Buffers
+const int MAX_FVG_TRACKED = 200  // FVGs monitored for inversion into iFVGs
+var CISDLevel[] cisd_array         = array.new<CISDLevel>(0)
+var FVGZone[]   fvg_array          = array.new<FVGZone>(0)
+var FVGZone[]   ifvg_array         = array.new<FVGZone>(0)
+
+// Visible Display Ring Buffers (Prevents Chart Object Leaks)
+var box[]   fvg_display_boxes      = array.new_box(0)
+var label[] fvg_display_labels     = array.new_label(0)
+var box[]   ifvg_display_boxes     = array.new_box(0)
+var label[] ifvg_display_labels    = array.new_label(0)
+
+// Safe drawing buffer garbage collection
+f_prune_cisd(int max_count) =>
+    while array.size(cisd_array) > max_count
+        CISDLevel old_item = array.shift(cisd_array)
+        if not na(old_item.lvl_line)
+            line.delete(old_item.lvl_line)
+        if not na(old_item.lvl_label)
+            label.delete(old_item.lvl_label)
+
+f_register_fvg_box(box b, label l, int max_count) =>
+    if not na(b)
+        array.push(fvg_display_boxes, b)
+        array.push(fvg_display_labels, l)
+        while array.size(fvg_display_boxes) > max_count
+            box old_b = array.shift(fvg_display_boxes)
+            label old_l = array.shift(fvg_display_labels)
+            box.delete(old_b)
+            if not na(old_l)
+                label.delete(old_l)
+
+f_register_ifvg_box(box b, label l, int max_count) =>
+    if not na(b)
+        array.push(ifvg_display_boxes, b)
+        array.push(ifvg_display_labels, l)
+        while array.size(ifvg_display_boxes) > max_count
+            box old_b = array.shift(ifvg_display_boxes)
+            label old_l = array.shift(ifvg_display_labels)
+            box.delete(old_b)
+            if not na(old_l)
+                label.delete(old_l)
+
+// Tracking buffer only; drawn boxes are retained by the display ring above
+f_prune_active_fvg(int max_count) =>
+    while array.size(fvg_array) > max_count
+        array.shift(fvg_array)
+
+f_prune_active_ifvg(int max_count) =>
+    while array.size(ifvg_array) > max_count
+        FVGZone old_item = array.shift(ifvg_array)
+        if not na(old_item.zone_box)
+            box.delete(old_item.zone_box)
+        if not na(old_item.zone_label)
+            label.delete(old_item.zone_label)
+
+// =============================================================================
+// 3. CISD ENGINE (CHANGE IN STATE OF DELIVERY)
+// =============================================================================
+
+c_range     = high - low
+c_body      = math.abs(close - open)
+body_ratio  = c_range > 0 ? c_body / c_range : 0.0
+
+// Displacement condition on confirmed close
+is_displacement = disp_atr_mult == 0.0 or (c_body >= disp_atr_mult * atr14)
+
+// Identify qualifying pullback pivot candles using Conviction %
+is_bear_pullback = (close < open) and (body_ratio >= conviction_fraction)
+is_bull_pullback = (close > open) and (body_ratio >= conviction_fraction)
+
+// Maximum bars scanned back when locating the origin candle of a delivery leg
+const int MAX_ORIGIN_LOOKBACK = 400
+
+// Locates the origin candle of the leg that just reversed: the extreme (highest high for a
+// bullish leg, lowest low for a bearish leg) since `from_bar`, then the first opposite-close
+// candle at or after that extreme. Its open becomes the new defense level.
+f_leg_origin(int from_bar, bool find_bear_origin) =>
+    int span    = math.max(0, math.min(bar_index - from_bar, MAX_ORIGIN_LOOKBACK))
+    int ext_off = 0
+    for k = 0 to span
+        if find_bear_origin ? high[k] > high[ext_off] : low[k] < low[ext_off]
+            ext_off := k
+    float o_price = open
+    int   o_bar   = bar_index
+    for k = ext_off to 0
+        if find_bear_origin ? close[k] < open[k] : close[k] > open[k]
+            o_price := open[k]
+            o_bar   := bar_index - k
+            break
+    [o_price, o_bar]
+
+// Draws the pending level that the opposite CISD must close through
+f_new_pending(int from_bar, float lvl, bool is_bull) =>
+    color c   = is_bull ? col_bull_cisd : col_bear_cisd
+    line  pl  = line.new(x1 = from_bar, y1 = lvl, x2 = bar_index + cisd_ext_bars, y2 = lvl,
+         xloc = xloc.bar_index, color = c, width = cisd_line_width, style = line_style_choice)
+    label plb = na
+    if show_cisd_labels
+        plb := label.new(x = bar_index + cisd_ext_bars, y = lvl, text = is_bull ? "+CISD" : "-CISD",
+             xloc = xloc.bar_index, yloc = yloc.price,
+             color = color.new(color.white, 100), textcolor = c,
+             style = label.style_none, size = size.small)
+    [pl, plb]
+
+// Clears or freezes previously confirmed CISD levels before a new one is plotted
+f_retire_confirmed() =>
+    if not keep_old_cisd_levels
+        while array.size(cisd_array) > 0
+            CISDLevel old_lvl = array.shift(cisd_array)
+            if not na(old_lvl.lvl_line)
+                line.delete(old_lvl.lvl_line)
+            if not na(old_lvl.lvl_label)
+                label.delete(old_lvl.lvl_label)
+
+// Active Delivery State: +1 Bullish Delivery, -1 Bearish Delivery, 0 Initializing
+var int delivery_state = 0
+var int leg_start_bar  = na
+
+// Key Defense Levels (open of the origin / breakout candle of the active delivery leg)
+var float bull_defense_level = na
+var int   bull_defense_bar   = na
+var float bear_defense_level = na
+var int   bear_defense_bar   = na
+
+// Candidate Pullback Boundaries to be broken for continuation
+var float candidate_bear_pb_high = na
+var float candidate_bull_pb_low  = na
+
+// Visual active pending line (the level the next opposite CISD must close through)
+var line  active_pending_line  = na
+var label active_pending_label = na
+
+if barstate.isconfirmed and show_cisd and bar_index > 5
+    bool defense_moved = false
+
+    // -------------------------------------------------------------------------
+    // Case 0: Initialization of Delivery Direction
+    // -------------------------------------------------------------------------
+    if delivery_state == 0
+        if is_displacement and close > open
+            delivery_state     := 1
+            bull_defense_level := open
+            bull_defense_bar   := bar_index
+            leg_start_bar      := bar_index
+            defense_moved      := true
+        else if is_displacement and close < open
+            delivery_state     := -1
+            bear_defense_level := open
+            bear_defense_bar   := bar_index
+            leg_start_bar      := bar_index
+            defense_moved      := true
+
+    // -------------------------------------------------------------------------
+    // Case 1: Active Bullish Delivery (+Delivery)
+    // -------------------------------------------------------------------------
+    else if delivery_state == 1
+        // Track candidate down-candle pullbacks within bullish delivery
+        if is_bear_pullback
+            candidate_bear_pb_high := high
+
+        // Continuation: displacement close above the latest pullback high raises the defense level
+        if not na(candidate_bear_pb_high) and close > candidate_bear_pb_high and is_displacement and close > open
+            bull_defense_level     := open
+            bull_defense_bar       := bar_index
+            candidate_bear_pb_high := na
+            defense_moved          := true
+
+        // Reversal: displacement close BELOW the active bullish defense level (no prior-bar cross
+        // requirement, so a shift is not missed when price drifted through the level first)
+        else if not na(bull_defense_level) and close < bull_defense_level and is_displacement and close < open
+            delivery_state := -1
+
+            // 1. Plot confirmed -CISD level at bull_defense_level
+            f_retire_confirmed()
+            line  l_cisd = line.new(x1 = bull_defense_bar, y1 = bull_defense_level, x2 = bar_index + cisd_ext_bars, y2 = bull_defense_level,
+                 xloc = xloc.bar_index, color = col_bear_cisd, width = cisd_line_width, style = line_style_choice)
+            label lbl_cisd = na
+            if show_cisd_labels
+                lbl_cisd := label.new(x = bar_index + cisd_ext_bars, y = bull_defense_level, text = "-CISD",
+                     xloc = xloc.bar_index, yloc = yloc.price,
+                     color = color.new(color.white, 100), textcolor = col_bear_cisd,
+                     style = label.style_none, size = size.small)
+            array.push(cisd_array, CISDLevel.new(l_cisd, lbl_cisd, bull_defense_level, -1, bull_defense_bar, false))
+            f_prune_cisd(max_cisd_lines)
+            alert("-CISD Bearish Delivery Shift Confirmed at " + str.tostring(bull_defense_level, format.mintick), alert.freq_once_per_bar_close)
+
+            // 2. New bearish defense level: open of the first down candle at the leg's swing high
+            [o_price, o_bar] = f_leg_origin(leg_start_bar, true)
+            bear_defense_level    := o_price
+            bear_defense_bar      := o_bar
+            leg_start_bar         := o_bar
+            candidate_bull_pb_low := na
+            bull_defense_level    := na
+            defense_moved         := true
+
+    // -------------------------------------------------------------------------
+    // Case 2: Active Bearish Delivery (-Delivery)
+    // -------------------------------------------------------------------------
+    else if delivery_state == -1
+        // Track candidate up-candle pullbacks within bearish delivery
+        if is_bull_pullback
+            candidate_bull_pb_low := low
+
+        // Continuation: displacement close below the latest pullback low lowers the defense level
+        if not na(candidate_bull_pb_low) and close < candidate_bull_pb_low and is_displacement and close < open
+            bear_defense_level    := open
+            bear_defense_bar      := bar_index
+            candidate_bull_pb_low := na
+            defense_moved         := true
+
+        // Reversal: displacement close ABOVE the active bearish defense level
+        else if not na(bear_defense_level) and close > bear_defense_level and is_displacement and close > open
+            delivery_state := 1
+
+            // 1. Plot confirmed +CISD level at bear_defense_level
+            f_retire_confirmed()
+            line  l_cisd = line.new(x1 = bear_defense_bar, y1 = bear_defense_level, x2 = bar_index + cisd_ext_bars, y2 = bear_defense_level,
+                 xloc = xloc.bar_index, color = col_bull_cisd, width = cisd_line_width, style = line_style_choice)
+            label lbl_cisd = na
+            if show_cisd_labels
+                lbl_cisd := label.new(x = bar_index + cisd_ext_bars, y = bear_defense_level, text = "+CISD",
+                     xloc = xloc.bar_index, yloc = yloc.price,
+                     color = color.new(color.white, 100), textcolor = col_bull_cisd,
+                     style = label.style_none, size = size.small)
+            array.push(cisd_array, CISDLevel.new(l_cisd, lbl_cisd, bear_defense_level, 1, bear_defense_bar, false))
+            f_prune_cisd(max_cisd_lines)
+            alert("+CISD Bullish Delivery Shift Confirmed at " + str.tostring(bear_defense_level, format.mintick), alert.freq_once_per_bar_close)
+
+            // 2. New bullish defense level: open of the first up candle at the leg's swing low
+            [o_price, o_bar] = f_leg_origin(leg_start_bar, false)
+            bull_defense_level     := o_price
+            bull_defense_bar       := o_bar
+            leg_start_bar          := o_bar
+            candidate_bear_pb_high := na
+            bear_defense_level     := na
+            defense_moved          := true
+
+    // Keep the pending line on the level that will actually trigger the next CISD
+    if defense_moved
+        if not na(active_pending_line)
+            line.delete(active_pending_line)
+        if not na(active_pending_label)
+            label.delete(active_pending_label)
+        bool  pend_bull = delivery_state == -1
+        float pend_lvl  = pend_bull ? bear_defense_level : bull_defense_level
+        int   pend_bar  = pend_bull ? bear_defense_bar : bull_defense_bar
+        [pl, plb] = f_new_pending(pend_bar, pend_lvl, pend_bull)
+        active_pending_line  := pl
+        active_pending_label := plb
+
+// Dynamically extend active pending level waiting to be broken
+if not na(active_pending_line)
+    line.set_x2(active_pending_line, bar_index + cisd_ext_bars)
+if not na(active_pending_label)
+    label.set_x(active_pending_label, bar_index + cisd_ext_bars)
+
+// =============================================================================
+// 4. FAIR VALUE GAP (FVG) & INVERTED FVG (iFVG) DYNAMIC ENGINE
+// =============================================================================
+
+if barstate.isconfirmed
+    // 1. Strict 3-Bar Imbalance Detection on confirmed close (Candles A=[2], B=[1], C=[0])
+    bool is_bull_fvg = (close[1] > open[1]) and (low > high[2]) and ((low - high[2]) >= min_fvg_pts)
+    bool is_bear_fvg = (close[1] < open[1]) and (high < low[2]) and ((low[2] - high) >= min_fvg_pts)
+    
+    // Internal FVG tracking runs if either Standard FVG or Inverted FVG display is active
+    if (show_fvg or show_ifvg) and bar_index > 3
+        if is_bull_fvg
+            float top_p   = low
+            float bot_p   = high[2]
+            int   left_b  = bar_index - 1
+            int   right_b = bar_index + extend_fvg_boxes
+            
+            box b_fvg = na
+            label lbl_fvg = na
+            if show_fvg
+                b_fvg := box.new(left = left_b, top = top_p, right = right_b, bottom = bot_p,
+                                 xloc = xloc.bar_index,
+                                 bgcolor = show_bg ? col_bull_fvg : color.new(color.white, 100),
+                                 border_color = show_borders ? color.new(col_bull_cisd, 60) : color.new(color.white, 100),
+                                 border_width = show_borders ? 1 : 0)
+                if show_fvg_labels
+                    lbl_fvg := label.new(x = right_b, y = (top_p + bot_p) / 2.0, text = "FVG",
+                                         xloc = xloc.bar_index, yloc = yloc.price,
+                                         color = color.new(color.white, 100), textcolor = col_bull_cisd,
+                                         style = label.style_none, size = size.tiny)
+                f_register_fvg_box(b_fvg, lbl_fvg, max_fvg_boxes)
+            
+            FVGZone new_fvg = FVGZone.new(b_fvg, lbl_fvg, top_p, bot_p, 1, left_b, false, false)
+            array.push(fvg_array, new_fvg)
+            f_prune_active_fvg(MAX_FVG_TRACKED)
+            
+        if is_bear_fvg
+            float top_p   = low[2]
+            float bot_p   = high
+            int   left_b  = bar_index - 1
+            int   right_b = bar_index + extend_fvg_boxes
+            
+            box b_fvg = na
+            label lbl_fvg = na
+            if show_fvg
+                b_fvg := box.new(left = left_b, top = top_p, right = right_b, bottom = bot_p,
+                                 xloc = xloc.bar_index,
+                                 bgcolor = show_bg ? col_bear_fvg : color.new(color.white, 100),
+                                 border_color = show_borders ? color.new(col_bear_cisd, 60) : color.new(color.white, 100),
+                                 border_width = show_borders ? 1 : 0)
+                if show_fvg_labels
+                    lbl_fvg := label.new(x = right_b, y = (top_p + bot_p) / 2.0, text = "FVG",
+                                         xloc = xloc.bar_index, yloc = yloc.price,
+                                         color = color.new(color.white, 100), textcolor = col_bear_cisd,
+                                         style = label.style_none, size = size.tiny)
+                f_register_fvg_box(b_fvg, lbl_fvg, max_fvg_boxes)
+            
+            FVGZone new_fvg = FVGZone.new(b_fvg, lbl_fvg, top_p, bot_p, -1, left_b, false, false)
+            array.push(fvg_array, new_fvg)
+            f_prune_active_fvg(MAX_FVG_TRACKED)
+
+    // 2. Inversion Evaluation (iFVG) of Active FVGs
+    // FVGs remain static and fixed. Only upon invalidation (close through the gap) does an iFVG spawn.
+    if array.size(fvg_array) > 0
+        for i = array.size(fvg_array) - 1 to 0
+            FVGZone item = array.get(fvg_array, i)
+            if not item.mitigated and not item.is_inverted
+                
+                // --- Bullish FVG Invalidation (Becomes Bearish iFVG) ---
+                if item.direction == 1
+                    if close < item.bottom
+                        item.is_inverted := true
+                        item.mitigated   := true
+                        
+                        if show_ifvg and (math.abs(item.top - item.bottom) >= min_ifvg_pts)
+                            int ifvg_right = bar_index + extend_fvg_boxes
+                            box b_ifvg = box.new(left = bar_index, top = item.top, right = ifvg_right, bottom = item.bottom,
+                                                 xloc = xloc.bar_index,
+                                                 bgcolor = show_bg ? col_bear_ifvg : color.new(color.white, 100),
+                                                 border_color = show_borders ? col_bear_cisd : color.new(color.white, 100),
+                                                 border_width = show_borders ? 1 : 0)
+                            
+                            label lbl_ifvg = na
+                            if show_ifvg_labels
+                                lbl_ifvg := label.new(x = ifvg_right, y = (item.top + item.bottom) / 2.0, text = "-iFVG",
+                                                      xloc = xloc.bar_index, yloc = yloc.price,
+                                                      color = color.new(color.white, 100), textcolor = col_bear_cisd,
+                                                      style = label.style_none, size = size.tiny)
+                            
+                            f_register_ifvg_box(b_ifvg, lbl_ifvg, max_ifvg_boxes)
+                            FVGZone new_inv = FVGZone.new(b_ifvg, lbl_ifvg, item.top, item.bottom, -1, bar_index, true, false)
+                            array.push(ifvg_array, new_inv)
+                            f_prune_active_ifvg(math.max(max_ifvg_boxes * 2, 20))
+                            alert("Bearish Inverted FVG (-iFVG) Formed at " + str.tostring(item.bottom), alert.freq_once_per_bar_close)
+                        
+                        array.remove(fvg_array, i)
+                
+                // --- Bearish FVG Invalidation (Becomes Bullish iFVG) ---
+                else if item.direction == -1
+                    if close > item.top
+                        item.is_inverted := true
+                        item.mitigated   := true
+                        
+                        if show_ifvg and (math.abs(item.top - item.bottom) >= min_ifvg_pts)
+                            int ifvg_right = bar_index + extend_fvg_boxes
+                            box b_ifvg = box.new(left = bar_index, top = item.top, right = ifvg_right, bottom = item.bottom,
+                                                 xloc = xloc.bar_index,
+                                                 bgcolor = show_bg ? col_bull_ifvg : color.new(color.white, 100),
+                                                 border_color = show_borders ? col_bull_cisd : color.new(color.white, 100),
+                                                 border_width = show_borders ? 1 : 0)
+                            
+                            label lbl_ifvg = na
+                            if show_ifvg_labels
+                                lbl_ifvg := label.new(x = ifvg_right, y = (item.top + item.bottom) / 2.0, text = "+iFVG",
+                                                      xloc = xloc.bar_index, yloc = yloc.price,
+                                                      color = color.new(color.white, 100), textcolor = col_bull_cisd,
+                                                      style = label.style_none, size = size.tiny)
+                            
+                            f_register_ifvg_box(b_ifvg, lbl_ifvg, max_ifvg_boxes)
+                            FVGZone new_inv = FVGZone.new(b_ifvg, lbl_ifvg, item.top, item.bottom, 1, bar_index, true, false)
+                            array.push(ifvg_array, new_inv)
+                            f_prune_active_ifvg(math.max(max_ifvg_boxes * 2, 20))
+                            alert("Bullish Inverted FVG (+iFVG) Formed at " + str.tostring(item.top), alert.freq_once_per_bar_close)
+                        
+                        array.remove(fvg_array, i)
+
+    // 3. Dynamic Evaluation of Active Inverted FVGs (iFVGs)
+    if array.size(ifvg_array) > 0
+        for i = array.size(ifvg_array) - 1 to 0
+            FVGZone item = array.get(ifvg_array, i)
+            if not item.mitigated
+                // Bearish iFVG invalidated if price breaks back above top
+                if item.direction == -1 and close > item.top
+                    item.mitigated := true
+                    array.remove(ifvg_array, i)
+                // Bullish iFVG invalidated if price breaks back below bottom
+                else if item.direction == 1 and close < item.bottom
+                    item.mitigated := true
+                    array.remove(ifvg_array, i)

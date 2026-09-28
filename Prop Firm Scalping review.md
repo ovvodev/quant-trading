@@ -4,10 +4,15 @@
 
 ## Verdict
 
-- **The scalping strategy has no edge on MNQ.** In its best configuration it makes +0.007R per trade before costs (t-stat 0.93, which can't be told apart from zero) and loses −0.007R per trade after costs.
-- **It is worse than luck in prop firm evaluations.** After costs it passes 14–25% of simulated evaluations. A strategy with the same payoff shape and zero edge passes 27–34%.
-- **Use MNQ, not NQ, for prop accounts.** One NQ contract risks about $1,400 at a typical stop, so on a 50k evaluation 94–99% of trades can't be sized at all.
-- **The best lead is not the scalp.** A 30-minute opening range breakout on MNQ beat the zero-edge pass rate (42–52% vs 26–30% on a 50k account). It is still not statistically proven and is weakening in 2025–26, so treat it as the next thing to research, not something to trade.
+*Updated after the strategy search in sections 6 and 7.*
+
+- **The scalping strategy has no edge on MNQ.** In its best configuration it makes +0.007R per trade before costs (t-stat 0.93, which can't be told apart from zero) and loses −0.007R per trade after costs. It passes fewer prop evaluations than a zero-edge strategy (14–25% vs 27–34%).
+- **No true scalp survives costs on MNQ.** A pre-registered search of 62 configurations across seven ideas found nothing that holds trades for minutes and makes money after costs.
+- **The best strategy found is intraday momentum, not a scalp.** It is the "noise area" strategy of Zarattini, Aziz & Barbon (2024), with the published parameters and trades lasting about two hours.
+  - **Edge:** about +$18 per MNQ contract per trade after costs (t-stat 2.7). It is positive in both data halves and every year, and trading the opposite side loses about as much.
+  - **Prop results:** on a 50k evaluation with end-of-day trailing drawdown, 2 MNQ passed 48% of evaluations vs 23% for zero edge.
+- **Big caveat: it has been flat for the last 17 months.** Since May 2025 it has made about $0 per trade. 38% of all profit came from three volatile months, 19% from April 2025 alone. It earns in volatile, trending markets and goes nowhere in calm ones.
+- **Use MNQ, not NQ, for prop accounts.** One NQ contract risks about $1,400 at a typical scalp stop, so on a 50k evaluation 94–99% of trades can't be sized at all.
 
 "R" throughout is the amount risked on a trade: +0.1R means a profit of one tenth of the stop distance.
 
@@ -94,7 +99,7 @@ What this means for choosing an evaluation:
 - **Size at about a quarter of the max loss per trade.** On a 50k account that's about $500, or 2–3 MNQ. At $200–300 the whole-contract floor skips 6–18% of scalp trades (33–65% of breakout trades), all of them the wide-stop days, which changes the strategy being tested. Larger sizes were not tested.
 - **A 50k account with MNQ is the right testbed.** The 150k template showed the same pattern relative to its baseline.
 
-## 5. The opening range breakout (research lead, not a strategy yet)
+## 5. The opening range breakout (first lead, later rejected)
 
 Rules tested:
 - Mark the high and low of the first 30 minutes after 09:30 New York time.
@@ -118,17 +123,101 @@ Why it isn't proven:
 - **Weakening:** 2025 was weak and 2026 is negative so far.
 - **Small evaluation sample:** its evaluation pass rates rest on only 23–56 completed cycles.
 
-Before any money goes into it:
-- test on ES/MES and at least one non-equity market;
-- test a short-only or trend-neutral version, to separate the breakout from the bull market;
-- walk-forward it with the range length and target chosen only on past data.
+**Follow-up (section 6): rejected.** Going long on the same bar, regardless of which way the range broke, earned almost as much (+0.051R vs +0.064R per trade). Most of the breakout's profit was the Nasdaq's upward drift, not the breakout. Under the pre-registered test its in-sample winner also failed out-of-sample.
 
-## 6. Recommendations
+## 6. Searching for the best short-term strategy
 
-1. **Do not trade the scalping strategy or buy evaluations for it.** Keep it as a well-instrumented test harness; that's what it's good for now.
-2. **If you do take a futures evaluation:** MNQ, 50k size, end-of-day trailing drawdown, fixed $400–500 risk per trade, New York hours only.
-3. **Next research step:** build the opening range breakout properly (Python plus Pine, reusing `backtesting_futures_prop()` and `zero_edge_trades()`), then run the checks in section 5.
-4. **Standing rule for any new signal:** report t-stat and costs from the first run, compare pass rates with the zero-edge baseline, and given how many configurations this repo has already tried, require t ≥ 3 before believing it.
+### How the search was run
+
+Hunting for "the best" strategy on one dataset is how overfit strategies get made, so the rules were fixed before any results were seen.
+
+- **Data split:** in-sample is Sep 2021 – Mar 2024; out-of-sample is Apr 2024 – Sep 2026.
+- **Selection:** the best configuration of each idea is chosen by in-sample net t-stat only, then tested out-of-sample once.
+- **Costs and fills:** $0.70 round-trip commission plus 1 tick of slippage per market fill. Take-profits need a 1-tick trade-through, and stops that gap past their level fill at the bar open.
+- **Pass/fail test:** a strategy counts only if it holds up out-of-sample and its prop pass rate beats the zero-edge baseline.
+
+### Round 1: 62 configurations, seven ideas
+
+| Idea | Configs | In-sample winner (net R/trade, t) | Same config out-of-sample |
+|---|---|---|---|
+| Bollinger pullback scalp (this repo) | 2 | +0.002 (t 0.14) | −0.002 (t −0.16) |
+| Opening range breakout (5/15/30/60 min) | 24 | 60 min, 1R, mid stop: +0.072 (t 1.87) | −0.027 (t −0.72) |
+| Late-day momentum (Gao et al.) | 8 | +0.107 (t **2.83**) | −0.068 (t **−2.06**) |
+| VWAP mean reversion | 12 | +0.008 (t 0.07) | −0.012 (t −0.10) |
+| VWAP trend pullback | 4 | +0.011 (t 0.22) | −0.068 (t −1.39) |
+| Gap fade | 6 | +0.022 (t 0.52) | +0.054 (t 1.35) |
+| Gap and go | 6 | +0.044 (t 0.61) | −0.055 (t −0.96) |
+
+- **Every true scalp lost after costs.** That covers the Bollinger pullback, VWAP reversion and VWAP trend pullback: anything holding for minutes. Gross edges of a few hundredths of R can't carry $1.20–1.70 of costs per contract.
+- **The best in-sample result of the whole search flipped to a significant loss out-of-sample** (late-day momentum, t 2.83 → −2.06). This is why the split matters: with 62 tries, a t of about 2.5 turns up by luck.
+- **Opening range breakouts with the stop at the far side of the range** were positive in 11 of 12 in-sample and 12 of 12 out-of-sample variants. The drift control in section 5 shows this is mostly Nasdaq's rise.
+- **The gap fade's profit is all on the short side** (fading up-gaps), so it's also drift-related.
+
+### Round 2: three published rules, parameters unchanged
+
+These rules come from published papers and were tested with the papers' own parameters, so there was nothing to tune. Only the Crabel filter involved a choice, made on the in-sample half.
+
+| Rule | In-sample | Out-of-sample | Verdict |
+|---|---|---|---|
+| 5-min ORB (Zarattini & Aziz 2023; 10R target, exit at close) | +0.045R (t 0.48) | +0.130R (t 1.34) | Not significant; 2026 negative |
+| Crabel narrow-range filter on the 30-min ORB (in-sample pick: "wide" days) | +0.127R (t 2.01) | −0.010R (t −0.18) | Failed out-of-sample |
+| **Noise-area momentum (Zarattini, Aziz & Barbon 2024)** | **+$16.15/contract (t 2.45)** | **+$17.46/contract (t 1.50)** | **Held up** (section 7) |
+
+## 7. The best strategy found: intraday momentum (noise area)
+
+Implemented in [Prop Firm Intraday Momentum backtest.py](Prop%20Firm%20Intraday%20Momentum%20backtest.py) and [Prop Firm Intraday Momentum strategy.pine](Prop%20Firm%20Intraday%20Momentum%20strategy.pine).
+
+**Rules**
+1. **Noise area:** for every minute of the session, average |price / today's open − 1| over the last 14 sessions. This is how far price usually wanders by that time of day.
+2. **Bands:** upper = max(open, previous close) × (1 + noise); lower = min(open, previous close) × (1 − noise).
+3. **Entries:** checked only at 10:00, 10:30 … 15:30 New York time. A close above the upper band goes long; a close below the lower band goes short.
+4. **Exits:** at the same half-hours, exit when price falls back inside the band or through the session VWAP, whichever is tighter. Flat at 16:00.
+5. **Protective stop:** one band-width from entry, checked every minute.
+   - It was the in-sample-best of four stop sizes and held out-of-sample (+$16.01, t 1.47).
+   - It cuts the worst trade from −$648 to −$438 per contract.
+
+**Results (per MNQ contract, after costs, Sep 2021 – Sep 2026)**
+
+| Measure | Value |
+|---|---|
+| Trades | 1,100 (~225 a year), 40% winners, average win $193 vs average loss $96 |
+| Net $ per trade | +$18.44 (t 2.74); in-sample +$19.65 (t 3.01), out-of-sample +$17.12 (t 1.40) |
+| Longs / shorts | +$25.18 / +$11.77, so both sides make money |
+| **Control: opposite side** | **−$21.84 (t −3.24).** The direction call is real, not drift |
+| Double costs | +$16.74 |
+| By year | 2021 +$476 (3 months), 2022 +$6,172, 2023 +$4,497, 2024 +$4,345, 2025 +$3,485, 2026 +$1,308 |
+| Daily Sharpe / max drawdown | 1.33 / $3,560 |
+| Parameter robustness (not used for selection) | Lookback 10/20/30 days, checks every 60 min, no-VWAP exit: all positive in both halves |
+
+**Prop evaluations (repeated cycles over 5 years, after costs; generic rule shapes)**
+
+| Rules | Size | Pass rate | Zero-edge baseline | Median days per cycle |
+|---|---|---|---|---|
+| 50k, EOD trailing $2k, $3k target, $1k daily | 1 MNQ | 75% (8 cycles) | 25% | 180 |
+| 50k, EOD trailing $2k, $3k target, $1k daily | **2 MNQ** | **48% (29 cycles)** | **23%** | **49** |
+| 50k, EOD trailing $2k, $3k target, $1k daily | 3 MNQ | 38% (56 cycles) | 25% | 22 |
+| 50k, intraday trailing $2.5k, $3k target | 2 MNQ | 41% (32 cycles) | 19% | 32 |
+| 150k, EOD trailing $4.5k, $9k target, $3k daily | 6 MNQ | 37% (43 cycles) | 19% | 34 |
+
+- **2 MNQ on a 50k end-of-day-trailing evaluation is the best trade-off.** It roughly doubles the zero-edge pass rate, with a median of about 7 weeks per attempt.
+- **1 MNQ passes more often but is too slow.** Around six months per attempt means monthly fees eat the advantage.
+- **Intraday trailing does worse, and the gap grows with size.** It ratchets the floor on open profit, which a trend strategy gives back; without the protective stop, intraday trailing fell below the zero-edge baseline.
+
+**Caveats. These are the reasons not to over-trust it.**
+- **Profit is concentrated.** The top 3 months produced 38% of all profit, and April 2025 (the tariff-shock volatility) produced 19%. Without April 2025, the out-of-sample average is +$10.28 per trade (t 1.01).
+- **Flat for 17 months.** From May 2025 to September 2026 it made +$95 in total per contract, about $0 per trade. 10 of 11 half-years are positive, but only 2025H2 lost, and it's the most recent. Momentum strategies earn in volatile, trending markets and chop in quiet ones, and it's not clear which regime comes next.
+- **Out-of-sample alone it isn't significant** (t 1.40). The case rests on the full-sample t of 2.7, a published rule with no tuning, and the strong opposite-side control.
+- **One instrument, 5 years.** It hasn't been tested on ES/MES or on data from before 2021.
+- **It is not a scalp.** Trades last about two hours and there are about one a day.
+
+## 8. Recommendations
+
+1. **Don't trade the Bollinger-pullback scalp or buy evaluations for it.** No short-hold scalp tested here survives MNQ costs.
+2. **If you want to attempt an evaluation, use the intraday momentum strategy:** MNQ, 50k account, **end-of-day** trailing drawdown, 2 MNQ, protective stop on.
+   - Expect roughly half of attempts to fail even if the edge is real.
+   - Given the flat last 17 months, **paper-trade it or run it on the cheapest evaluation first**, and set in advance how long a flat stretch you'll accept.
+3. **Don't add filters to fix the flat period** (volatility-regime filters and the like). Both halves of the data have now been looked at, so there's no clean test left to validate a new filter. New evidence has to come from live or paper trading from here on, or from ES/MES data and pre-2021 history.
+4. **Standing rule for any new signal:** decide the test in advance, split the data, report net t-stats, compare with the opposite-side control and the zero-edge pass rate, and require t ≥ 3 before believing a result from a large search.
 
 ## Appendix: how to reproduce
 
@@ -136,4 +225,9 @@ Before any money goes into it:
 /usr/bin/python3 -c "import importlib.util as u; s=u.spec_from_file_location('p','Prop Firm Scalping backtest.py'); m=u.module_from_spec(s); s.loader.exec_module(m); m.main('MNQ')"
 ```
 
-Use `main('GBPUSD')`, `main('MNQ_ALL_SESSIONS')` or `main('NQ')` for the other instruments. The opening range breakout numbers came from a one-off research script that is not yet in the repo.
+Use `main('GBPUSD')`, `main('MNQ_ALL_SESSIONS')` or `main('NQ')` for the other instruments.
+
+```bash
+/usr/bin/python3 "Prop Firm Intraday Momentum backtest.py"   # section 7
+/usr/bin/python3 "Prop Firm Strategy Search.py"              # sections 5-6
+```

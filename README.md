@@ -67,6 +67,8 @@ Most scripts inside this repository are technical indicator automated trading. T
 
 * <a href=https://github.com/je-suis-tm/quant-trading#18-prop-firm-scalping>Prop Firm Scalping</a>
 
+* <a href=https://github.com/je-suis-tm/quant-trading#19-prop-firm-intraday-momentum>Prop Firm Intraday Momentum</a>
+
 &nbsp;
 
 ### Data Source
@@ -327,6 +329,18 @@ Prop firm pass rates are only meaningful against a baseline, so the script now c
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20mnq%20all%20sessions%20equity%20curve.png)
 
 ![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20scalping%20mnq%20all%20sessions%20sample%20session.png)
+
+### 19. Prop Firm Intraday Momentum
+
+Strategy No.18 failed on MNQ, so the obvious next question is whether any short-term strategy survives costs well enough to be worth a prop firm evaluation fee. To avoid fooling ourselves, the search was run with the rules fixed in advance: 5 years of MNQ 1 minute data split into an in-sample half (2021-2024) and an out-of-sample half (2024-2026), the best version of each idea picked on the in-sample half only, and then tested once on the out-of-sample half, net of commission and slippage. 62 configurations of seven ideas went in: the Bollinger pullback scalp, VWAP mean reversion, VWAP trend pullbacks, opening range breakouts, late-day momentum, gap fades and gap-and-go. Every true scalp - anything holding a trade for minutes - lost money after costs. The single best in-sample result of the whole search (late-day momentum, t-stat 2.83) flipped to a loss out of sample (t-stat -2.06), which is exactly why the protocol matters. Opening range breakouts made money in both halves, but mostly because the Nasdaq went up: going long on the same bar regardless of the breakout direction earned nearly as much.
+
+The one idea that held up is intraday momentum from Zarattini, Aziz & Barbon (2024), "Beat the Market: An Effective Intraday Momentum Strategy for S&P500 ETF (SPY)", used with its published parameters so there was nothing to overfit. For every minute of the day it measures how far price normally wanders from the open (the "noise area", averaged over 14 days). Every half hour from 10:00, if price has broken out of that noise area it goes with the move, and it exits when price falls back inside the band or through the session VWAP, or at the close. A protective stop one band-width away, chosen on the in-sample half only, caps the worst trade. On MNQ it makes about +$18 per contract per trade after costs (t-stat 2.7), is positive in both halves and in every year, and trading the opposite side loses about as much, so the direction call is real rather than drift. On a generic 50k futures evaluation with a $2,000 end-of-day trailing drawdown, 2 MNQ passed about 48% of repeated evaluations, against about 23% for a zero-edge strategy with the same payoff shape. It is not a scalp (trades last about two hours), out of sample on its own it is not independently significant (t-stat 1.4), and it should be used with end-of-day rather than intraday trailing drawdown rules. The biggest caveat is recent: profit is concentrated in volatile stretches (the top three months made 38% of it, April 2025 alone 19%), and from May 2025 to September 2026 it made about nothing - momentum earns in trending markets and goes sideways in quiet ones, so paper trade it before paying for an evaluation. The full search is written up in <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Scalping%20review.md>Prop Firm Scalping review.md</a>.
+
+*Click <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Intraday%20Momentum%20backtest.py>here</a> to be redirected to the Python backtest, or <a href=https://github.com/je-suis-tm/quant-trading/blob/master/Prop%20Firm%20Intraday%20Momentum%20strategy.pine>here</a> for the Pine Script v6 version.*
+
+![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20intraday%20momentum%20equity%20curve.png)
+
+![alt text](https://github.com/je-suis-tm/quant-trading/blob/master/preview/prop%20firm%20intraday%20momentum%20sample%20session.png)
 
 <br>
 

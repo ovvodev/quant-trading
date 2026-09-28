@@ -1,0 +1,1051 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// iFVG Ultimate — Institutional-Grade Multi-Module Indicator
+// Pine Script v6 | TradingView
+// ═══════════════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("iFVG Ultimate", shorttitle="iFVG Ultimate", overlay=true,
+     max_boxes_count=500, max_labels_count=500, max_lines_count=500, max_bars_back=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 1 — INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── General ──────────────────────────────────────────────────────────────────
+grp_gen    = "GENERAL"
+i_theme    = input.string("Dark", "Theme", options=["Dark","Light"], group=grp_gen)
+
+// ── IFVG Detection ──────────────────────────────────────────────────────────
+grp_ifvg        = "IFVG DETECTION"
+i_ifvgLookback  = input.int(20, "Setup Lookback", minval=3, maxval=60, group=grp_ifvg, tooltip="Bars to scan backwards for an opposing FVG that creates the inversion")
+i_ifvgProj      = input.int(10, "Box Projection (bars)", minval=1, maxval=50, group=grp_ifvg)
+i_ifvgCE        = input.bool(true, "Show CE (50%) Line", group=grp_ifvg)
+i_ifvgColorChg  = input.bool(true, "Change Box Color on Price Touch", group=grp_ifvg)
+i_ifvgExtend    = input.bool(false, "Extend Boxes to Right", group=grp_ifvg)
+i_ifvgDelFail   = input.bool(false, "Delete Invalid Setups", group=grp_ifvg)
+
+// ── IFVG Style ──────────────────────────────────────────────────────────────
+grp_ifvgS    = "IFVG STYLE"
+i_bullCol    = input.color(color.new(#089981, 75), "Bullish iFVG Color", group=grp_ifvgS)
+i_bearCol    = input.color(color.new(#f23645, 75), "Bearish iFVG Color", group=grp_ifvgS)
+i_testBull   = input.color(color.new(#089981, 90), "Tested Bullish Color", group=grp_ifvgS)
+i_testBear   = input.color(color.new(#f23645, 90), "Tested Bearish Color", group=grp_ifvgS)
+i_failCol    = input.color(color.new(color.gray, 90), "Failed Color", group=grp_ifvgS)
+i_lblSizeIn  = input.string("Small", "Label Size", options=["Tiny","Small","Normal","Large"], group=grp_ifvgS)
+
+// ── Entry Signals & Automation ──────────────────────────────────────────────
+grp_sig        = "ENTRY SIGNALS & AUTOMATION"
+i_sigShow      = input.bool(true, "Show Signals on Chart", inline="s0", group=grp_sig)
+i_sigStyle     = input.string("Triangle", "", inline="s0", options=["Triangle", "Arrow", "Label"], group=grp_sig)
+i_sigTrigger   = input.string("Inversion Creation", "Trigger On", options=["Inversion Creation", "Retest / Touch", "Both"], group=grp_sig, tooltip="Inversion Creation: signal on the bar that flips the FVG. Retest / Touch: signal when price bounces off the iFVG.")
+i_sigKzFilter  = input.bool(false, "Filter: Killzones Only", group=grp_sig, tooltip="Only trigger signals during enabled session killzones")
+i_sigHtfFilter = input.bool(false, "Filter: HTF Bias Confluence", group=grp_sig, tooltip="Only Long if 15m/1H Swing is Bullish, only Short if Bearish")
+i_sigExitShow  = input.bool(true, "Show Invalidation / Stop Signals (✕)", group=grp_sig)
+i_sigLongCol   = input.color(#089981, "Long Color", inline="sc1", group=grp_sig)
+i_sigShortCol  = input.color(#f23645, "Short Color", inline="sc1", group=grp_sig)
+
+// ── PDI (Predistribution Inversion) Engine ──────────────────────────────────
+grp_pdi          = "PDI (PREDISTRIBUTION INVERSION) ENGINE"
+i_pdiEnable      = input.bool(true, "Enable PDI Strategy Model", group=grp_pdi, tooltip="Filters iFVG setups to only those matching the AMD / PDI sequence from the strategy guide")
+i_pdiOnlyStier   = input.bool(false, "S-Tier Setups Only", group=grp_pdi, tooltip="Only trigger setups that meet strict S-Tier criteria (clear manipulation sweep + R:R >= 1.5)")
+i_pdiMinRR       = input.float(1.2, "Minimum R:R Ratio (Rule 1)", minval=0.5, step=0.1, group=grp_pdi, tooltip="Rule 1: Filters out setups where inversion close is too far from manipulation extreme giving poor R:R")
+i_pdiFilterHtf   = input.bool(true, "Block Opposing HTF FVG (Rule 4)", group=grp_pdi, tooltip="Rule 4: Suppresses Bearish PDI inside Bullish HTF FVG, and vice versa")
+i_pdiShowLevels  = input.bool(true, "Show PDI SL & TP Targets", group=grp_pdi, tooltip="Plots dynamic Stop Loss at manipulation wick and TP1 at opposite accumulation shelf")
+i_pdiShowAmd     = input.bool(true, "Show AMD Visual Annotations (A & M)", group=grp_pdi, tooltip="Draws Accumulation box [A] and Manipulation sweep marker [M]")
+i_pdiAccLen      = input.int(15, "Accumulation Scan Length", minval=5, maxval=40, group=grp_pdi, tooltip="Bars used to define the accumulation range before a sweep")
+i_pdiAccAtrMax   = input.float(2.5, "Max Accumulation Range (ATR)", minval=0.5, step=0.1, group=grp_pdi, tooltip="Reject very wide/noisy ranges")
+i_pdiManipBars   = input.int(12, "Max Manipulation Leg Bars", minval=3, maxval=40, group=grp_pdi)
+i_pdiMinGapAtr   = input.float(0.05, "Min FVG Size (ATR)", minval=0.0, step=0.01, group=grp_pdi)
+i_pdiMaxLegFvgs  = input.int(1, "Max Significant FVGs In Manipulation", minval=1, maxval=5, group=grp_pdi, tooltip="The PDF's optimal PDI has one significant FVG in the manipulation leg")
+i_pdiEqFilter    = input.bool(true, "Block Trades Against EQH / EQL (Rule 3)", group=grp_pdi)
+i_pdiExtremePct  = input.float(0.45, "S-Tier: IFVG Near Manipulation Extreme", minval=0.1, maxval=1.0, step=0.05, group=grp_pdi)
+i_pdiRequireEqS  = input.bool(true, "S-Tier Requires EQH / EQL At Accumulation Edge", group=grp_pdi)
+
+// ── HTF FVG Overlay ─────────────────────────────────────────────────────────
+grp_htf      = "HTF FVG OVERLAY"
+i_htf1en     = input.bool(true, "HTF 1", inline="h1", group=grp_htf)
+i_htf1tf     = input.timeframe("5", "", inline="h1", group=grp_htf)
+i_htf1cnt    = input.int(3, "", inline="h1", minval=1, maxval=15, group=grp_htf)
+i_htf2en     = input.bool(true, "HTF 2", inline="h2", group=grp_htf)
+i_htf2tf     = input.timeframe("15", "", inline="h2", group=grp_htf)
+i_htf2cnt    = input.int(3, "", inline="h2", minval=1, maxval=15, group=grp_htf)
+i_htf3en     = input.bool(true, "HTF 3", inline="h3", group=grp_htf)
+i_htf3tf     = input.timeframe("60", "", inline="h3", group=grp_htf)
+i_htf3cnt    = input.int(2, "", inline="h3", minval=1, maxval=15, group=grp_htf)
+i_htf4en     = input.bool(true, "HTF 4", inline="h4", group=grp_htf)
+i_htf4tf     = input.timeframe("240", "", inline="h4", group=grp_htf)
+i_htf4cnt    = input.int(2, "", inline="h4", minval=1, maxval=15, group=grp_htf)
+i_htf5en     = input.bool(false, "HTF 5", inline="h5", group=grp_htf)
+i_htf5tf     = input.timeframe("D", "", inline="h5", group=grp_htf)
+i_htf5cnt    = input.int(2, "", inline="h5", minval=1, maxval=15, group=grp_htf)
+i_htf6en     = input.bool(false, "HTF 6", inline="h6", group=grp_htf)
+i_htf6tf     = input.timeframe("W", "", inline="h6", group=grp_htf)
+i_htf6cnt    = input.int(2, "", inline="h6", minval=1, maxval=15, group=grp_htf)
+i_htfHigher  = input.bool(true, "Only Show Higher TFs", group=grp_htf, tooltip="Skip FVGs from TFs lower than or equal to the current chart")
+i_htfBullCol = input.color(color.new(#787b86, 88), "Bullish HTF FVG", group=grp_htf)
+i_htfBearCol = input.color(color.new(#787b86, 88), "Bearish HTF FVG", group=grp_htf)
+
+// ── Killzones ───────────────────────────────────────────────────────────────
+grp_kz       = "KILLZONES"
+i_kzShow     = input.bool(true, "Show Killzone Boxes", inline="kz0", group=grp_kz)
+i_kzText     = input.bool(true, "Display Text", inline="kz0", group=grp_kz)
+i_kzTz       = input.string("America/New_York", "Timezone", options=["America/New_York","America/Chicago","Europe/London","Europe/Berlin","Asia/Tokyo","Asia/Singapore","Asia/Hong_Kong","UTC"], group=grp_kz)
+i_kzBoxTr    = input.int(80, "Box Transparency", minval=0, maxval=100, group=grp_kz)
+i_kzTxtTr    = input.int(70, "Text Transparency", minval=0, maxval=100, group=grp_kz)
+
+i_kz1en      = input.bool(true,  "", inline="s1", group=grp_kz)
+i_kz1name    = input.string("Asia", "", inline="s1", group=grp_kz)
+i_kz1sess    = input.session("2000-0000", "", inline="s1", group=grp_kz)
+i_kz1col     = input.color(color.blue, "", inline="s1", group=grp_kz)
+
+i_kz2en      = input.bool(true,  "", inline="s2", group=grp_kz)
+i_kz2name    = input.string("London", "", inline="s2", group=grp_kz)
+i_kz2sess    = input.session("0200-0500", "", inline="s2", group=grp_kz)
+i_kz2col     = input.color(color.red, "", inline="s2", group=grp_kz)
+
+i_kz3en      = input.bool(true,  "", inline="s3", group=grp_kz)
+i_kz3name    = input.string("New York", "", inline="s3", group=grp_kz)
+i_kz3sess    = input.session("0930-1100", "", inline="s3", group=grp_kz)
+i_kz3col     = input.color(color.teal, "", inline="s3", group=grp_kz)
+
+i_kz4en      = input.bool(false, "", inline="s4", group=grp_kz)
+i_kz4name    = input.string("NY Lunch", "", inline="s4", group=grp_kz)
+i_kz4sess    = input.session("1200-1300", "", inline="s4", group=grp_kz)
+i_kz4col     = input.color(color.yellow, "", inline="s4", group=grp_kz)
+
+i_kz5en      = input.bool(false, "", inline="s5", group=grp_kz)
+i_kz5name    = input.string("NY PM", "", inline="s5", group=grp_kz)
+i_kz5sess    = input.session("1330-1600", "", inline="s5", group=grp_kz)
+i_kz5col     = input.color(color.purple, "", inline="s5", group=grp_kz)
+
+// ── Killzone Pivots ─────────────────────────────────────────────────────────
+grp_kzp        = "KILLZONE PIVOTS"
+i_kzpShow      = input.bool(true,  "Show Pivots", inline="kp0", group=grp_kzp)
+i_kzpAlert     = input.bool(true,  "Alert Broken Pivots", inline="kp0", group=grp_kzp)
+i_kzpLabels    = input.bool(true,  "Show Pivot Labels", group=grp_kzp)
+i_kzpMitigate  = input.bool(true,  "Stop Once Mitigated", group=grp_kzp)
+i_kzpRight     = input.bool(true,  "Right Side", group=grp_kzp, tooltip="Place labels at the right edge of the chart")
+i_kzpStyle     = input.string("Solid", "Pivot Style", options=["Solid","Dashed","Dotted"], group=grp_kzp)
+i_kzpWidth     = input.int(1, "Line Width", minval=1, maxval=4, group=grp_kzp)
+
+i_kz1hLbl = input.string("Asia High", "KZ 1 Labels", inline="kl1", group=grp_kzp)
+i_kz1lLbl = input.string("Asia Low", "", inline="kl1", group=grp_kzp)
+i_kz2hLbl = input.string("London High", "KZ 2 Labels", inline="kl2", group=grp_kzp)
+i_kz2lLbl = input.string("London Low", "", inline="kl2", group=grp_kzp)
+i_kz3hLbl = input.string("New York High", "KZ 3 Labels", inline="kl3", group=grp_kzp)
+i_kz3lLbl = input.string("New York Low", "", inline="kl3", group=grp_kzp)
+i_kz4hLbl = input.string("NYL.H", "KZ 4 Labels", inline="kl4", group=grp_kzp)
+i_kz4lLbl = input.string("NYL.L", "", inline="kl4", group=grp_kzp)
+i_kz5hLbl = input.string("NYPM.H", "KZ 5 Labels", inline="kl5", group=grp_kzp)
+i_kz5lLbl = input.string("NYPM.L", "", inline="kl5", group=grp_kzp)
+
+// ── HTF Info Table ──────────────────────────────────────────────────────────
+grp_tbl     = "HTF INFO TABLE"
+i_tblShow   = input.bool(true, "Show HTF Info Table", group=grp_tbl)
+i_tblPos    = input.string("Top Right", "Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=grp_tbl)
+
+// ── Opening Prices ──────────────────────────────────────────────────────────
+grp_op       = "OPENING PRICES"
+i_opTDO      = input.bool(true, "", inline="op1", group=grp_op)
+i_opTDOlbl   = input.string("D OPEN", "", inline="op1", group=grp_op)
+i_opTDOcol   = input.color(color.white, "", inline="op1", group=grp_op)
+i_opPDH      = input.bool(true, "", inline="op2", group=grp_op)
+i_opPDHlbl   = input.string("PDH", "", inline="op2", group=grp_op)
+i_opPDHcol   = input.color(color.gray, "", inline="op2", group=grp_op)
+i_opPDL      = input.bool(true, "", inline="op3", group=grp_op)
+i_opPDLlbl   = input.string("PDL", "", inline="op3", group=grp_op)
+i_opPDLcol   = input.color(#00bcd4, "", inline="op3", group=grp_op)
+
+// ── EQH / EQL ───────────────────────────────────────────────────────────────
+grp_eq       = "EQH / EQL"
+i_eqShow     = input.bool(true, "Show EQH / EQL", group=grp_eq)
+i_eqLen      = input.int(5, "Pivot Length", minval=2, maxval=20, group=grp_eq)
+i_eqThresh   = input.float(0.015, "Equal Threshold (%)", minval=0.001, maxval=0.5, step=0.005, group=grp_eq, tooltip="Max price difference as % between pivots to qualify as Equal Highs/Lows")
+i_eqHiCol    = input.color(color.blue, "Line Color for Highs", group=grp_eq)
+i_eqLoCol    = input.color(color.red,  "Line Color for Lows", group=grp_eq)
+i_eqWidth    = input.int(1, "Line Width", minval=1, maxval=4, group=grp_eq)
+i_eqStyleIn  = input.string("Dash", "Line Style", options=["Solid","Dash","Dotted"], group=grp_eq)
+i_eqMaxLines = input.int(5, "Max Active Levels", minval=1, maxval=15, group=grp_eq, tooltip="Maximum active unmitigated equal high/low lines to display")
+
+// ── SMT Divergence ──────────────────────────────────────────────────────────
+grp_smt      = "DIVERGENCE"
+i_smtShow    = input.bool(true, "Show Divergence on Chart", group=grp_smt)
+i_smt1en     = input.bool(true,  "Pair 1", inline="d1", group=grp_smt)
+i_smt1sym    = input.symbol("CAPITALCOM:US500", "", inline="d1", group=grp_smt)
+i_smtPivLen  = input.int(5, "Pivot Length", minval=2, maxval=20, group=grp_smt)
+
+// ── Day Label ───────────────────────────────────────────────────────────────
+grp_day      = "DAY LABEL"
+i_dayShow    = input.bool(true, "Show Day of Week", group=grp_day)
+i_daySize    = input.string("Large", "Size", options=["Small","Normal","Large","Huge"], group=grp_day)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 2 — CONSTANTS, TYPES, HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+color txtColor = i_theme == "Light" ? color.black : color.white
+
+string lblSize = switch i_lblSizeIn
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+
+string kzpLineStyle = switch i_kzpStyle
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    "Dotted" => line.style_dotted
+    => line.style_solid
+
+string eqLineStyle = switch i_eqStyleIn
+    "Solid"  => line.style_solid
+    "Dash"   => line.style_dashed
+    "Dotted" => line.style_dotted
+    => line.style_dashed
+
+string dayLblSize = switch i_daySize
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+    => size.large
+
+// ── UDTs ─────────────────────────────────────────────────────────────────────
+type IfvgSetup
+    box   bx
+    label lbl
+    line  ce
+    bool  isBull
+    float top
+    float btm
+    bool  isValid  = true
+    bool  isTested = false
+    bool  pdiValid = false
+    bool  pdiSTier = false
+    float pdiSL    = na
+    float pdiTP    = na
+    float pdiRR    = na
+
+// Tracks the FVG created inside the manipulation leg until it is truly inverted.
+type PdiCandidate
+    float top
+    float btm
+    bool  originalBull
+    int   createdBar
+
+type HtfFvgData
+    box    bx
+    label  lbl
+    float  top
+    float  btm
+    bool   isBull  = false
+    bool   filled  = false
+    int    startTime = 0
+    int    tfSlot  = 0
+    string tfLabel = ""
+
+type KzData
+    box   bx
+    label txt
+    float hi       = na
+    float lo       = na
+    int   startBar = na
+    line  hiLine
+    line  loLine
+    label hiLbl
+    label loLbl
+    bool  hiMit    = false
+    bool  loMit    = false
+    float hiVal    = na
+    float loVal    = na
+    bool  wasIn    = false
+
+type EqLevel
+    line  ln
+    label lbl
+    float price
+    bool  isHigh
+    bool  mitigated = false
+    int   startBar  = 0
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+rangesOverlap(float top1, float btm1, float top2, float btm2) =>
+    math.max(btm1, btm2) < math.min(top1, top2)
+
+f_formatTime(int ms) =>
+    int totalSecs = math.max(0, ms / 1000)
+    int h = totalSecs / 3600
+    int m = (totalSecs % 3600) / 60
+    int s = totalSecs % 60
+    string mStr = m < 10 ? "0" + str.tostring(m) : str.tostring(m)
+    string sStr = s < 10 ? "0" + str.tostring(s) : str.tostring(s)
+    h > 0 ? str.tostring(h) + ":" + mStr + ":" + sStr : mStr + ":" + sStr
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 3 — FUNCTIONS FOR SECURITY CALLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+f_htfFvg() =>
+    bool ib = low[1] > high[3]
+    bool ir = high[1] < low[3]
+    [ib, low[1], high[3], ir, low[3], high[1], time[3]]
+
+f_htfInfo() =>
+    var array<float> _gT = array.new<float>()
+    var array<float> _gB = array.new<float>()
+    var array<int>   _gD = array.new<int>()
+    var array<bool>  _gX = array.new<bool>()
+    if low[1] > high[3]
+        array.push(_gT, low[1]),  array.push(_gB, high[3])
+        array.push(_gD, 1),      array.push(_gX, false)
+    if high[1] < low[3]
+        array.push(_gT, low[3]), array.push(_gB, high[1])
+        array.push(_gD, -1),     array.push(_gX, false)
+    while array.size(_gD) > 40
+        array.shift(_gT), array.shift(_gB)
+        array.shift(_gD), array.shift(_gX)
+    if array.size(_gD) > 0
+        for i = array.size(_gD) - 1 to 0
+            float gt = array.get(_gT, i)
+            float gb = array.get(_gB, i)
+            int   gd = array.get(_gD, i)
+            bool dead = gd == 1 ? close[1] < gb : close[1] > gt
+            if dead
+                array.remove(_gT, i), array.remove(_gB, i)
+                array.remove(_gD, i), array.remove(_gX, i)
+            else
+                if gd == 1 ? low[1] < gt : high[1] > gb
+                    array.set(_gX, i, true)
+    int _bias = 0
+    if array.size(_gD) > 0
+        for i = array.size(_gD) - 1 to 0
+            if array.get(_gX, i)
+                _bias := array.get(_gD, i)
+                break
+    int _exp = close > open ? 1 : close < open ? -1 : 0
+    int _tc  = time_close
+    [_bias, _exp, _tc]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 4 — SECURITY CALLS (all at global scope)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+[h1bl, h1bt, h1bb, h1br, h1st, h1sb, h1gt] = request.security(syminfo.tickerid, i_htf1tf, f_htfFvg(), lookahead=barmerge.lookahead_on)
+[h2bl, h2bt, h2bb, h2br, h2st, h2sb, h2gt] = request.security(syminfo.tickerid, i_htf2tf, f_htfFvg(), lookahead=barmerge.lookahead_on)
+[h3bl, h3bt, h3bb, h3br, h3st, h3sb, h3gt] = request.security(syminfo.tickerid, i_htf3tf, f_htfFvg(), lookahead=barmerge.lookahead_on)
+[h4bl, h4bt, h4bb, h4br, h4st, h4sb, h4gt] = request.security(syminfo.tickerid, i_htf4tf, f_htfFvg(), lookahead=barmerge.lookahead_on)
+[h5bl, h5bt, h5bb, h5br, h5st, h5sb, h5gt] = request.security(syminfo.tickerid, i_htf5tf, f_htfFvg(), lookahead=barmerge.lookahead_on)
+[h6bl, h6bt, h6bb, h6br, h6st, h6sb, h6gt] = request.security(syminfo.tickerid, i_htf6tf, f_htfFvg(), lookahead=barmerge.lookahead_on)
+
+[bias5m,  exp5m,  tc5m]  = request.security(syminfo.tickerid, "5",   f_htfInfo(), lookahead=barmerge.lookahead_off)
+[bias15m, exp15m, tc15m] = request.security(syminfo.tickerid, "15",  f_htfInfo(), lookahead=barmerge.lookahead_off)
+[bias1h,  exp1h,  tc1h]  = request.security(syminfo.tickerid, "60",  f_htfInfo(), lookahead=barmerge.lookahead_off)
+[bias4h,  exp4h,  tc4h]  = request.security(syminfo.tickerid, "240", f_htfInfo(), lookahead=barmerge.lookahead_off)
+
+[_pdh, _pdl, _dOpen] = request.security(syminfo.tickerid, "D", [high[1], low[1], open], lookahead=barmerge.lookahead_on)
+
+[_pairHigh, _pairLow] = request.security(i_smt1sym, timeframe.period, [high, low])
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 5 — PERSISTENT STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var IfvgSetup[]  activeSetups = array.new<IfvgSetup>()
+var HtfFvgData[] htfArr       = array.new<HtfFvgData>()
+
+var KzData[] kzArr = array.new<KzData>()
+if barstate.isfirst
+    for _i = 0 to 4
+        array.push(kzArr, KzData.new())
+
+var array<float> eqHighPrices = array.new<float>()
+var array<int>   eqHighBars   = array.new<int>()
+var array<float> eqLowPrices  = array.new<float>()
+var array<int>   eqLowBars    = array.new<int>()
+var EqLevel[]    activeEqLevels = array.new<EqLevel>()
+
+var float smtLastPH = na, var float smtPrevPH = na
+var float smtLastPL = na, var float smtPrevPL = na
+var float smtPairPH = na, var float smtPairPrevPH = na
+var float smtPairPL = na, var float smtPairPrevPL = na
+var int   smtDivResult = 0
+
+var line  opTDOLine = na, var label opTDOLbl = na
+var line  opPDHLine = na, var label opPDHLbl = na
+var line  opPDLLine = na, var label opPDLLbl = na
+
+var bool alertBullIfvg = false
+var bool alertBearIfvg = false
+var bool alertSweepHi  = false
+var bool alertSweepLo  = false
+
+var bool sigLong      = false
+var bool sigShort     = false
+var bool sigExitLong  = false
+var bool sigExitShort = false
+
+// PDI Strategy State
+var float pdiCurSL     = na
+var float pdiCurTP     = na
+var float pdiCurRR     = na
+var bool  pdiIsSTier   = false
+var line  pdiSLLine    = na
+var label pdiSLLbl     = na
+var line  pdiTPLine    = na
+var label pdiTPLbl     = na
+var box   pdiAccBox    = na
+var label pdiAccLbl    = na
+var label pdiManipLbl  = na
+var bool  sigPdiLong   = false
+var bool  sigPdiShort  = false
+
+// PDI state machine: 0 = idle, 1 = bullish distribution candidate, -1 = bearish distribution candidate
+var int   pdiState          = 0
+var float pdiAccHighState   = na
+var float pdiAccLowState    = na
+var float pdiManipExtreme   = na
+var int   pdiManipStartBar  = na
+var PdiCandidate[] pdiCandidates = array.new<PdiCandidate>()
+var int   pdiLegFvgCount    = 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 6 — REFINED TRUE IFVG + PDI STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool inKz1 = i_kz1en and not na(time(timeframe.period, i_kz1sess, i_kzTz))
+bool inKz2 = i_kz2en and not na(time(timeframe.period, i_kz2sess, i_kzTz))
+bool inKz3 = i_kz3en and not na(time(timeframe.period, i_kz3sess, i_kzTz))
+bool inKz4 = i_kz4en and not na(time(timeframe.period, i_kz4sess, i_kzTz))
+bool inKz5 = i_kz5en and not na(time(timeframe.period, i_kz5sess, i_kzTz))
+bool inAnyKz = inKz1 or inKz2 or inKz3 or inKz4 or inKz5
+bool kzFilterPass = not i_sigKzFilter or inAnyKz
+bool htfLongPass  = not i_sigHtfFilter or (bias15m >= 0 and bias1h >= 0)
+bool htfShortPass = not i_sigHtfFilter or (bias15m <= 0 and bias1h <= 0)
+
+f_inOpposingHtfFvg(bool isBullSetup) =>
+    bool blocked = false
+    if array.size(htfArr) > 0
+        for _k = 0 to array.size(htfArr) - 1
+            HtfFvgData h = array.get(htfArr, _k)
+            if not h.filled
+                if isBullSetup and not h.isBull and close >= h.btm and close <= h.top
+                    blocked := true
+                    break
+                if not isBullSetup and h.isBull and close >= h.btm and close <= h.top
+                    blocked := true
+                    break
+    blocked
+
+// Rule 3: do not trade toward nearby, unswept equal liquidity before TP1.
+f_eqBlocks(bool isBullSetup, float entry, float stop) =>
+    bool blocked = false
+    if i_pdiEqFilter and array.size(activeEqLevels) > 0
+        for _k = 0 to array.size(activeEqLevels) - 1
+            EqLevel eq = array.get(activeEqLevels, _k)
+            if not eq.mitigated
+                bool against = isBullSetup ? (not eq.isHigh and eq.price < entry and eq.price > stop) : (eq.isHigh and eq.price > entry and eq.price < stop)
+                if against
+                    blocked := true
+                    break
+    blocked
+
+// S-tier helper: equal liquidity should sit at the accumulation edge that was swept.
+f_hasEdgeEq(bool isBullSetup, float accHigh, float accLow) =>
+    bool found = false
+    float edge = isBullSetup ? accLow : accHigh
+    float tol = math.max(syminfo.mintick * 4, math.abs(accHigh - accLow) * 0.12)
+    if array.size(activeEqLevels) > 0
+        for _k = 0 to array.size(activeEqLevels) - 1
+            EqLevel eq = array.get(activeEqLevels, _k)
+            bool sideOk = isBullSetup ? not eq.isHigh : eq.isHigh
+            if sideOk and math.abs(eq.price - edge) <= tol
+                found := true
+                break
+    found
+
+alertBullIfvg := false
+alertBearIfvg := false
+sigLong       := false
+sigShort      := false
+sigExitLong   := false
+sigExitShort  := false
+sigPdiLong    := false
+sigPdiShort   := false
+
+bool rawBullFVG = low > high[2]
+bool rawBearFVG = high < low[2]
+float atrPdi = ta.atr(14)
+
+// STEP 1 + 2: identify a reasonably tight accumulation, then a genuine sweep/manipulation.
+if barstate.isconfirmed and bar_index > i_pdiAccLen + 5
+    float accHighNow = ta.highest(high[1], i_pdiAccLen)
+    float accLowNow  = ta.lowest(low[1], i_pdiAccLen)
+    float accRangeNow = accHighNow - accLowNow
+    bool accumulationTight = accRangeNow <= atrPdi * i_pdiAccAtrMax
+
+    if pdiState == 0 and accumulationTight
+        if low < accLowNow
+            pdiState         := 1
+            pdiAccHighState  := accHighNow
+            pdiAccLowState   := accLowNow
+            pdiManipExtreme  := low
+            pdiManipStartBar := bar_index
+            pdiLegFvgCount   := 0
+            array.clear(pdiCandidates)
+        else if high > accHighNow
+            pdiState         := -1
+            pdiAccHighState  := accHighNow
+            pdiAccLowState   := accLowNow
+            pdiManipExtreme  := high
+            pdiManipStartBar := bar_index
+            pdiLegFvgCount   := 0
+            array.clear(pdiCandidates)
+
+    // STEP 3: track significant FVGs created during the manipulation leg.
+    if pdiState != 0
+        int elapsed = bar_index - pdiManipStartBar
+        pdiManipExtreme := pdiState == 1 ? math.min(pdiManipExtreme, low) : math.max(pdiManipExtreme, high)
+
+        if elapsed > i_pdiManipBars
+            pdiState := 0
+            array.clear(pdiCandidates)
+            pdiLegFvgCount := 0
+        else
+            float gapSize = rawBullFVG ? (low - high[2]) : rawBearFVG ? (low[2] - high) : 0.0
+            bool significantGap = gapSize >= atrPdi * i_pdiMinGapAtr
+            bool correctManipFvg = pdiState == 1 ? rawBearFVG : rawBullFVG
+            if correctManipFvg and significantGap
+                float cTop = rawBearFVG ? low[2] : low
+                float cBtm = rawBearFVG ? high : high[2]
+                array.push(pdiCandidates, PdiCandidate.new(cTop, cBtm, rawBullFVG, bar_index))
+                pdiLegFvgCount += 1
+
+            // STEP 4: true inversion = a confirmed close through the far side of the manipulation FVG.
+            if array.size(pdiCandidates) > 0 and pdiLegFvgCount <= i_pdiMaxLegFvgs
+                PdiCandidate c = array.get(pdiCandidates, 0)
+                bool bullInversion = pdiState == 1 and close > c.top
+                bool bearInversion = pdiState == -1 and close < c.btm
+
+                if bullInversion or bearInversion
+                    bool isBullSetup = bullInversion
+                    float pdiSL = isBullSetup ? pdiManipExtreme - syminfo.mintick * 2 : pdiManipExtreme + syminfo.mintick * 2
+                    float pdiTP = isBullSetup ? pdiAccHighState : pdiAccLowState
+                    float risk = math.max(syminfo.mintick, math.abs(close - pdiSL))
+                    float reward = isBullSetup ? math.max(0.0, pdiTP - close) : math.max(0.0, close - pdiTP)
+                    float calcRR = reward / risk
+                    bool passRR = calcRR >= i_pdiMinRR and (isBullSetup ? close < pdiTP and close > pdiSL : close > pdiTP and close < pdiSL)
+                    bool passRule4 = not i_pdiFilterHtf or not f_inOpposingHtfFvg(isBullSetup)
+                    bool passRule3 = not f_eqBlocks(isBullSetup, close, pdiSL)
+                    float manipRange = math.max(syminfo.mintick, isBullSetup ? pdiAccLowState - pdiManipExtreme : pdiManipExtreme - pdiAccHighState)
+                    float distanceFromExtreme = isBullSetup ? close - pdiManipExtreme : pdiManipExtreme - close
+                    bool nearExtreme = distanceFromExtreme <= manipRange * i_pdiExtremePct
+                    bool edgeEq = f_hasEdgeEq(isBullSetup, pdiAccHighState, pdiAccLowState)
+                    bool isSTier = passRR and passRule3 and passRule4 and nearExtreme and (not i_pdiRequireEqS or edgeEq) and pdiLegFvgCount == 1
+                    bool pdiValid = not i_pdiEnable or (passRR and passRule3 and passRule4 and pdiLegFvgCount <= i_pdiMaxLegFvgs and (not i_pdiOnlyStier or isSTier))
+
+                    // Visual IFVG is the original manipulation FVG after its confirmed polarity flip.
+                    int rightX = i_ifvgExtend ? bar_index + 5 : bar_index + i_ifvgProj
+                    float mid = (c.top + c.btm) / 2.0
+                    color boxCol = isBullSetup ? i_bullCol : i_bearCol
+                    string txtSym = isBullSetup ? "+iFVG" : "-iFVG"
+                    box b = box.new(c.createdBar - 2, c.top, rightX, c.btm, bgcolor=boxCol, border_color=boxCol)
+                    label l = label.new(rightX, mid, txtSym, color=color.new(color.white, 100), textcolor=txtColor, style=label.style_none, size=lblSize)
+                    line ceLine = na
+                    if i_ifvgCE
+                        ceLine := line.new(c.createdBar - 2, mid, rightX, mid, color=color.new(txtColor, 60), style=line.style_dashed)
+                    array.push(activeSetups, IfvgSetup.new(b, l, ceLine, isBullSetup, c.top, c.btm, true, false, pdiValid, isSTier, pdiSL, pdiTP, calcRR))
+
+                    if isBullSetup
+                        alertBullIfvg := true
+                        if pdiValid and kzFilterPass and htfLongPass and (i_sigTrigger == "Inversion Creation" or i_sigTrigger == "Both")
+                            sigLong := true
+                            sigPdiLong := true
+                    else
+                        alertBearIfvg := true
+                        if pdiValid and kzFilterPass and htfShortPass and (i_sigTrigger == "Inversion Creation" or i_sigTrigger == "Both")
+                            sigShort := true
+                            sigPdiShort := true
+
+                    if pdiValid
+                        pdiCurSL := pdiSL
+                        pdiCurTP := pdiTP
+                        pdiCurRR := calcRR
+                        pdiIsSTier := isSTier
+                        if i_pdiShowLevels
+                            line.delete(pdiSLLine), label.delete(pdiSLLbl)
+                            line.delete(pdiTPLine), label.delete(pdiTPLbl)
+                            pdiSLLine := line.new(bar_index, pdiSL, bar_index + 15, pdiSL, color=color.red, style=line.style_dashed, width=1)
+                            pdiSLLbl := label.new(bar_index + 15, pdiSL, "SL: " + str.tostring(pdiSL, format.mintick), style=label.style_none, textcolor=color.red, size=size.tiny)
+                            pdiTPLine := line.new(bar_index, pdiTP, bar_index + 15, pdiTP, color=color.green, style=line.style_dashed, width=1)
+                            pdiTPLbl := label.new(bar_index + 15, pdiTP, "TP1: " + str.tostring(pdiTP, format.mintick) + " (" + str.tostring(calcRR, "#.#") + "R)", style=label.style_none, textcolor=color.green, size=size.tiny)
+                        if i_pdiShowAmd
+                            box.delete(pdiAccBox), label.delete(pdiAccLbl), label.delete(pdiManipLbl)
+                            int accLeft = bar_index - elapsed - i_pdiAccLen
+                            int accRight = pdiManipStartBar - 1
+                            pdiAccBox := box.new(accLeft, pdiAccHighState, accRight, pdiAccLowState, bgcolor=color.new(color.gray, 92), border_color=color.new(color.gray, 70), border_style=line.style_dotted)
+                            pdiAccLbl := label.new(math.round((accLeft + accRight) / 2), pdiAccHighState, "A (Accumulation)", style=label.style_none, textcolor=color.new(txtColor, 40), size=size.tiny)
+                            pdiManipLbl := label.new(pdiManipStartBar, pdiManipExtreme, isBullSetup ? "M (Sweep Low)" : "M (Sweep High)", style=isBullSetup ? label.style_label_up : label.style_label_down, color=color.new(color.purple, 30), textcolor=color.white, size=size.tiny)
+
+                    pdiState := 0
+                    array.clear(pdiCandidates)
+                    pdiLegFvgCount := 0
+
+while array.size(activeSetups) > 50
+    IfvgSetup old = array.shift(activeSetups)
+    box.delete(old.bx), label.delete(old.lbl), line.delete(old.ce)
+
+// Manage confirmed iFVGs. Retest signals inherit the original PDI validation.
+if array.size(activeSetups) > 0
+    for i = array.size(activeSetups) - 1 to 0
+        IfvgSetup s = array.get(activeSetups, i)
+        if s.isValid
+            bool failed = s.isBull ? close < s.btm : close > s.top
+            if failed and barstate.isconfirmed
+                if s.isBull
+                    sigExitLong := true
+                else
+                    sigExitShort := true
+                if i_ifvgDelFail
+                    box.delete(s.bx), label.delete(s.lbl), line.delete(s.ce)
+                    array.remove(activeSetups, i)
+                else
+                    box.set_bgcolor(s.bx, i_failCol)
+                    box.set_border_color(s.bx, i_failCol)
+                    label.set_textcolor(s.lbl, color.new(txtColor, 50))
+                    line.delete(s.ce)
+                    s.isValid := false
+            else
+                if i_ifvgColorChg and not s.isTested
+                    bool touched = low <= s.top and high >= s.btm
+                    if touched
+                        color testedCol = s.isBull ? i_testBull : i_testBear
+                        box.set_bgcolor(s.bx, testedCol)
+                        box.set_border_color(s.bx, testedCol)
+                        s.isTested := true
+                        bool allowRetest = not i_pdiEnable or s.pdiValid
+                        if allowRetest and barstate.isconfirmed and (i_sigTrigger == "Retest / Touch" or i_sigTrigger == "Both")
+                            if s.isBull and close > open and kzFilterPass and htfLongPass
+                                sigLong := true
+                                sigPdiLong := s.pdiValid
+                                pdiCurSL := s.pdiSL
+                                pdiCurTP := s.pdiTP
+                                pdiCurRR := s.pdiRR
+                                pdiIsSTier := s.pdiSTier
+                            if not s.isBull and close < open and kzFilterPass and htfShortPass
+                                sigShort := true
+                                sigPdiShort := s.pdiValid
+                                pdiCurSL := s.pdiSL
+                                pdiCurTP := s.pdiTP
+                                pdiCurRR := s.pdiRR
+                                pdiIsSTier := s.pdiSTier
+                if i_ifvgExtend
+                    box.set_right(s.bx, bar_index + 5)
+                    label.set_x(s.lbl, bar_index + 5)
+                    if not na(s.ce)
+                        line.set_x2(s.ce, bar_index + 5)
+
+if not na(pdiSLLine)
+    line.set_x2(pdiSLLine, bar_index + 15)
+    label.set_x(pdiSLLbl, bar_index + 15)
+if not na(pdiTPLine)
+    line.set_x2(pdiTPLine, bar_index + 15)
+    label.set_x(pdiTPLbl, bar_index + 15)
+if not na(pdiCurTP) and not na(pdiCurSL)
+    bool hitTP = pdiCurTP > pdiCurSL ? high >= pdiCurTP : low <= pdiCurTP
+    bool hitSL = pdiCurTP > pdiCurSL ? low <= pdiCurSL : high >= pdiCurSL
+    if (hitTP or hitSL) and barstate.isconfirmed
+        pdiCurTP := na
+        pdiCurSL := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 7 — HTF FVG OVERLAY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+int currentTfSecs = timeframe.in_seconds()
+int htfRightTime  = time + nz(time - time[1], 60000) * 10
+
+int[]    htfMaxCnts = array.from(i_htf1cnt, i_htf2cnt, i_htf3cnt, i_htf4cnt, i_htf5cnt, i_htf6cnt)
+bool[]   htfEnabled = array.from(i_htf1en, i_htf2en, i_htf3en, i_htf4en, i_htf5en, i_htf6en)
+string[] htfTfStrs  = array.from(i_htf1tf, i_htf2tf, i_htf3tf, i_htf4tf, i_htf5tf, i_htf6tf)
+
+f_addHtfFvg(bool enabled, string tfStr, int slot, bool bl, float bt, float bb, bool br, float st, float sb, int gt) =>
+    bool isHigher = timeframe.in_seconds(tfStr) > currentTfSecs
+    bool canShow  = enabled and (not i_htfHigher or isHigher)
+    if canShow and gt != gt[1]
+        if bl
+            array.push(htfArr, HtfFvgData.new(na, na, bt, bb, true, false, gt, slot, tfStr))
+        if br
+            array.push(htfArr, HtfFvgData.new(na, na, st, sb, false, false, gt, slot, tfStr))
+
+f_addHtfFvg(i_htf1en, i_htf1tf, 0, h1bl, h1bt, h1bb, h1br, h1st, h1sb, h1gt)
+f_addHtfFvg(i_htf2en, i_htf2tf, 1, h2bl, h2bt, h2bb, h2br, h2st, h2sb, h2gt)
+f_addHtfFvg(i_htf3en, i_htf3tf, 2, h3bl, h3bt, h3bb, h3br, h3st, h3sb, h3gt)
+f_addHtfFvg(i_htf4en, i_htf4tf, 3, h4bl, h4bt, h4bb, h4br, h4st, h4sb, h4gt)
+f_addHtfFvg(i_htf5en, i_htf5tf, 4, h5bl, h5bt, h5bb, h5br, h5st, h5sb, h5gt)
+f_addHtfFvg(i_htf6en, i_htf6tf, 5, h6bl, h6bt, h6bb, h6br, h6st, h6sb, h6gt)
+
+if array.size(htfArr) > 0
+    for i = array.size(htfArr) - 1 to 0
+        HtfFvgData f = array.get(htfArr, i)
+        if not f.filled
+            if (f.isBull and low <= f.btm) or (not f.isBull and high >= f.top)
+                f.filled := true
+
+int[] htfVisCounts = array.new<int>(6, 0)
+if array.size(htfArr) > 0
+    for i = array.size(htfArr) - 1 to 0
+        HtfFvgData f = array.get(htfArr, i)
+        int slot     = f.tfSlot
+        int maxCnt   = array.get(htfMaxCnts, slot)
+        int shown    = array.get(htfVisCounts, slot)
+        bool slotOn  = array.get(htfEnabled, slot)
+        bool higher  = timeframe.in_seconds(f.tfLabel) > currentTfSecs
+        bool canDraw = slotOn and (not i_htfHigher or higher) and not f.filled and shown < maxCnt
+
+        if canDraw
+            array.set(htfVisCounts, slot, shown + 1)
+            color bCol = f.isBull ? i_htfBullCol : i_htfBearCol
+            if na(f.bx)
+                f.bx  := box.new(left=f.startTime, top=f.top, right=htfRightTime, bottom=f.btm, xloc=xloc.bar_time, bgcolor=bCol, border_color=na)
+                f.lbl := label.new(x=htfRightTime, y=(f.top + f.btm) / 2, text=f.tfLabel, xloc=xloc.bar_time, style=label.style_none, textcolor=txtColor, size=size.small)
+            else
+                box.set_right(f.bx, htfRightTime)
+                box.set_bgcolor(f.bx, bCol)
+                box.set_border_color(f.bx, na)
+                label.set_x(f.lbl, htfRightTime)
+        else
+            if not na(f.bx)
+                box.delete(f.bx), label.delete(f.lbl)
+                f.bx := na, f.lbl := na
+
+while array.size(htfArr) > 120
+    HtfFvgData oldest = array.shift(htfArr)
+    if not na(oldest.bx)
+        box.delete(oldest.bx), label.delete(oldest.lbl)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 8 — KILLZONE SESSIONS + PIVOTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool[]   kzInArr   = array.from(inKz1, inKz2, inKz3, inKz4, inKz5)
+bool[]   kzEnArr   = array.from(i_kz1en, i_kz2en, i_kz3en, i_kz4en, i_kz5en)
+color[]  kzColArr  = array.from(i_kz1col, i_kz2col, i_kz3col, i_kz4col, i_kz5col)
+string[] kzNameArr = array.from(i_kz1name, i_kz2name, i_kz3name, i_kz4name, i_kz5name)
+string[] kzHArr    = array.from(i_kz1hLbl, i_kz2hLbl, i_kz3hLbl, i_kz4hLbl, i_kz5hLbl)
+string[] kzLArr    = array.from(i_kz1lLbl, i_kz2lLbl, i_kz3lLbl, i_kz4lLbl, i_kz5lLbl)
+
+alertSweepHi := false
+alertSweepLo := false
+
+for idx = 0 to 4
+    if not array.get(kzEnArr, idx)
+        continue
+
+    bool  inSess = array.get(kzInArr, idx)
+    color col    = array.get(kzColArr, idx)
+    string name  = array.get(kzNameArr, idx)
+    KzData kz    = array.get(kzArr, idx)
+
+    bool sessStart = inSess and not kz.wasIn
+    bool sessEnd   = not inSess and kz.wasIn
+
+    if sessStart
+        kz.hi       := high
+        kz.lo       := low
+        kz.startBar := bar_index
+        if i_kzShow
+            kz.bx  := box.new(bar_index, high, bar_index, low, bgcolor=color.new(col, i_kzBoxTr), border_color=na)
+            if i_kzText
+                kz.txt := label.new(bar_index, (high + low) / 2, name, style=label.style_none, textcolor=color.new(col, i_kzTxtTr), size=size.huge)
+
+    if inSess
+        kz.hi := math.max(nz(kz.hi, high), high)
+        kz.lo := math.min(nz(kz.lo, low), low)
+        if i_kzShow and not na(kz.bx)
+            box.set_top(kz.bx, kz.hi)
+            box.set_bottom(kz.bx, kz.lo)
+            box.set_right(kz.bx, bar_index)
+            if i_kzText and not na(kz.txt)
+                label.set_x(kz.txt, math.round((nz(kz.startBar, bar_index) + bar_index) / 2))
+                label.set_y(kz.txt, (kz.hi + kz.lo) / 2)
+
+    if sessEnd
+        kz.hiVal := kz.hi
+        kz.loVal := kz.lo
+        kz.hiMit := false
+        kz.loMit := false
+        if i_kzpShow
+            line.delete(kz.hiLine), line.delete(kz.loLine)
+            label.delete(kz.hiLbl), label.delete(kz.loLbl)
+            kz.hiLine := line.new(bar_index, kz.hiVal, bar_index + 20, kz.hiVal, color=col, style=kzpLineStyle, width=i_kzpWidth)
+            kz.loLine := line.new(bar_index, kz.loVal, bar_index + 20, kz.loVal, color=col, style=kzpLineStyle, width=i_kzpWidth)
+            if i_kzpLabels
+                kz.hiLbl := label.new(bar_index + 20, kz.hiVal, array.get(kzHArr, idx), style=label.style_none, textcolor=col, size=size.small)
+                kz.loLbl := label.new(bar_index + 20, kz.loVal, array.get(kzLArr, idx), style=label.style_none, textcolor=col, size=size.small)
+
+    if not inSess and not na(kz.hiVal) and i_kzpShow
+        if not kz.hiMit and not na(kz.hiLine)
+            line.set_x2(kz.hiLine, bar_index + 20)
+            if i_kzpLabels and not na(kz.hiLbl)
+                label.set_x(kz.hiLbl, bar_index + 20)
+            if i_kzpMitigate and close > kz.hiVal and barstate.isconfirmed
+                kz.hiMit := true
+                alertSweepHi := true
+        if not kz.loMit and not na(kz.loLine)
+            line.set_x2(kz.loLine, bar_index + 20)
+            if i_kzpLabels and not na(kz.loLbl)
+                label.set_x(kz.loLbl, bar_index + 20)
+            if i_kzpMitigate and close < kz.loVal and barstate.isconfirmed
+                kz.loMit := true
+                alertSweepLo := true
+
+    kz.wasIn := inSess
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 9 — OPENING PRICES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool newDay = ta.change(time("D")) != 0
+
+if newDay
+    line.delete(opTDOLine), label.delete(opTDOLbl)
+    if i_opTDO
+        opTDOLine := line.new(bar_index, _dOpen, bar_index + 20, _dOpen, color=i_opTDOcol, style=line.style_dotted)
+        opTDOLbl  := label.new(bar_index + 20, _dOpen, i_opTDOlbl, style=label.style_none, textcolor=i_opTDOcol, size=size.small)
+
+    line.delete(opPDHLine), label.delete(opPDHLbl)
+    if i_opPDH
+        opPDHLine := line.new(bar_index, _pdh, bar_index + 20, _pdh, color=i_opPDHcol, style=line.style_dotted)
+        opPDHLbl  := label.new(bar_index + 20, _pdh, i_opPDHlbl, style=label.style_none, textcolor=i_opPDHcol, size=size.small)
+
+    line.delete(opPDLLine), label.delete(opPDLLbl)
+    if i_opPDL
+        opPDLLine := line.new(bar_index, _pdl, bar_index + 20, _pdl, color=i_opPDLcol, style=line.style_dotted)
+        opPDLLbl  := label.new(bar_index + 20, _pdl, i_opPDLlbl, style=label.style_none, textcolor=i_opPDLcol, size=size.small)
+
+if not na(opTDOLine) and i_opTDO
+    line.set_x2(opTDOLine, bar_index + 20)
+    label.set_x(opTDOLbl,  bar_index + 20)
+if not na(opPDHLine) and i_opPDH
+    line.set_x2(opPDHLine, bar_index + 20)
+    label.set_x(opPDHLbl,  bar_index + 20)
+if not na(opPDLLine) and i_opPDL
+    line.set_x2(opPDLLine, bar_index + 20)
+    label.set_x(opPDLLbl,  bar_index + 20)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 10 — EQH / EQL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if i_eqShow
+    float ph = ta.pivothigh(high, i_eqLen, i_eqLen)
+    if not na(ph)
+        int pivotBar = bar_index - i_eqLen
+        float tol    = ph * i_eqThresh / 100
+        if array.size(eqHighPrices) > 0
+            for j = 0 to array.size(eqHighPrices) - 1
+                float prev = array.get(eqHighPrices, j)
+                if math.abs(ph - prev) <= tol
+                    float eqLevel = (ph + prev) / 2
+                    int prevBar   = array.get(eqHighBars, j)
+                    line  ln  = line.new(prevBar, eqLevel, bar_index + 10, eqLevel, color=i_eqHiCol, width=i_eqWidth, style=eqLineStyle)
+                    label lbl = label.new(bar_index + 10, eqLevel, "EQH", style=label.style_none, textcolor=i_eqHiCol, size=size.tiny)
+                    array.push(activeEqLevels, EqLevel.new(ln, lbl, eqLevel, true, false, prevBar))
+                    break
+        array.push(eqHighPrices, ph)
+        array.push(eqHighBars, pivotBar)
+        while array.size(eqHighPrices) > 20
+            array.shift(eqHighPrices), array.shift(eqHighBars)
+
+    float pl = ta.pivotlow(low, i_eqLen, i_eqLen)
+    if not na(pl)
+        int pivotBarL = bar_index - i_eqLen
+        float tolL    = pl * i_eqThresh / 100
+        if array.size(eqLowPrices) > 0
+            for j = 0 to array.size(eqLowPrices) - 1
+                float prev = array.get(eqLowPrices, j)
+                if math.abs(pl - prev) <= tolL
+                    float eqLevel = (pl + prev) / 2
+                    int prevBar   = array.get(eqLowBars, j)
+                    line  ln  = line.new(prevBar, eqLevel, bar_index + 10, eqLevel, color=i_eqLoCol, width=i_eqWidth, style=eqLineStyle)
+                    label lbl = label.new(bar_index + 10, eqLevel, "EQL", style=label.style_none, textcolor=i_eqLoCol, size=size.tiny)
+                    array.push(activeEqLevels, EqLevel.new(ln, lbl, eqLevel, false, false, prevBar))
+                    break
+        array.push(eqLowPrices, pl)
+        array.push(eqLowBars, pivotBarL)
+        while array.size(eqLowPrices) > 20
+            array.shift(eqLowPrices), array.shift(eqLowBars)
+
+    // Update active EQ levels: extend while unmitigated, freeze when swept
+    if array.size(activeEqLevels) > 0
+        for k = array.size(activeEqLevels) - 1 to 0
+            EqLevel eq = array.get(activeEqLevels, k)
+            if not eq.mitigated
+                line.set_x2(eq.ln, bar_index + 10)
+                label.set_x(eq.lbl, bar_index + 10)
+                bool swept = eq.isHigh ? high > eq.price : low < eq.price
+                if swept and barstate.isconfirmed
+                    eq.mitigated := true
+                    line.set_x2(eq.ln, bar_index)
+                    label.set_x(eq.lbl, bar_index)
+
+    // Prune old levels so chart stays clean
+    while array.size(activeEqLevels) > i_eqMaxLines * 2
+        EqLevel oldEq = array.shift(activeEqLevels)
+        line.delete(oldEq.ln), label.delete(oldEq.lbl)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 11 — SMT DIVERGENCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if i_smt1en
+    float smtPh = ta.pivothigh(high, i_smtPivLen, i_smtPivLen)
+    if not na(smtPh)
+        smtPrevPH := smtLastPH
+        smtLastPH := smtPh
+    float smtPl = ta.pivotlow(low, i_smtPivLen, i_smtPivLen)
+    if not na(smtPl)
+        smtPrevPL := smtLastPL
+        smtLastPL := smtPl
+    float pairPh = ta.pivothigh(_pairHigh, i_smtPivLen, i_smtPivLen)
+    if not na(pairPh)
+        smtPairPrevPH := smtPairPH
+        smtPairPH     := pairPh
+    float pairPl = ta.pivotlow(_pairLow, i_smtPivLen, i_smtPivLen)
+    if not na(pairPl)
+        smtPairPrevPL := smtPairPL
+        smtPairPL     := pairPl
+
+    bool bearDiv = not na(smtPrevPH) and not na(smtPairPrevPH) and smtLastPH > smtPrevPH and smtPairPH < smtPairPrevPH
+    bool bullDiv = not na(smtPrevPL) and not na(smtPairPrevPL) and smtLastPL < smtPrevPL and smtPairPL > smtPairPrevPL
+    smtDivResult := bullDiv ? 1 : bearDiv ? -1 : 0
+
+    if i_smtShow
+        if not na(smtPh) and bearDiv
+            label.new(bar_index - i_smtPivLen, high[i_smtPivLen], "SMT▼", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 30), size=size.tiny)
+        if not na(smtPl) and bullDiv
+            label.new(bar_index - i_smtPivLen, low[i_smtPivLen], "SMT▲", style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 30), size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 12 — DAY LABEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if i_dayShow and newDay
+    string dayName = switch dayofweek
+        dayofweek.sunday    => "SUNDAY"
+        dayofweek.monday    => "MONDAY"
+        dayofweek.tuesday   => "TUESDAY"
+        dayofweek.wednesday => "WEDNESDAY"
+        dayofweek.thursday  => "THURSDAY"
+        dayofweek.friday    => "FRIDAY"
+        dayofweek.saturday  => "SATURDAY"
+        => ""
+    if str.length(dayName) > 0
+        label.new(bar_index, high + ta.atr(14) * 1.5, dayName, style=label.style_none, textcolor=color.new(txtColor, 60), size=dayLblSize)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 13 — HTF INFO TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if i_tblShow
+    var string tblPosition = switch i_tblPos
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        => position.top_right
+
+    var table infoTbl = table.new(tblPosition, 5, 5, border_width=1, border_color=color.new(color.gray, 70))
+
+    if barstate.islast
+        table.cell(infoTbl, 0, 0, "",           text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+        table.cell(infoTbl, 1, 0, "5m",         text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+        table.cell(infoTbl, 2, 0, "15m",        text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+        table.cell(infoTbl, 3, 0, "1H",         text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+        table.cell(infoTbl, 4, 0, "4H",         text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+
+        table.cell(infoTbl, 0, 1, "Time",       text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 85))
+        table.cell(infoTbl, 1, 1, f_formatTime(nz(tc5m)  - timenow), text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 90))
+        table.cell(infoTbl, 2, 1, f_formatTime(nz(tc15m) - timenow), text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 90))
+        table.cell(infoTbl, 3, 1, f_formatTime(nz(tc1h)  - timenow), text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 90))
+        table.cell(infoTbl, 4, 1, f_formatTime(nz(tc4h)  - timenow), text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 90))
+
+        // Swing row
+        table.cell(infoTbl, 0, 2, "Swing", text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 85))
+        table.cell(infoTbl, 1, 2, bias5m == 1 ? "△" : bias5m == -1 ? "▽" : "—", text_color=txtColor, text_size=size.small, bgcolor=bias5m == 1 ? color.new(#089981, 60) : bias5m == -1 ? color.new(#f23645, 60) : color.new(color.gray, 85))
+        table.cell(infoTbl, 2, 2, bias15m == 1 ? "△" : bias15m == -1 ? "▽" : "—", text_color=txtColor, text_size=size.small, bgcolor=bias15m == 1 ? color.new(#089981, 60) : bias15m == -1 ? color.new(#f23645, 60) : color.new(color.gray, 85))
+        table.cell(infoTbl, 3, 2, bias1h == 1 ? "△" : bias1h == -1 ? "▽" : "—", text_color=txtColor, text_size=size.small, bgcolor=bias1h == 1 ? color.new(#089981, 60) : bias1h == -1 ? color.new(#f23645, 60) : color.new(color.gray, 85))
+        table.cell(infoTbl, 4, 2, bias4h == 1 ? "△" : bias4h == -1 ? "▽" : "—", text_color=txtColor, text_size=size.small, bgcolor=bias4h == 1 ? color.new(#089981, 60) : bias4h == -1 ? color.new(#f23645, 60) : color.new(color.gray, 85))
+
+        // Expand row
+        table.cell(infoTbl, 0, 3, "Expand", text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 85))
+        table.cell(infoTbl, 1, 3, exp5m == 1 ? "▲" : exp5m == -1 ? "▼" : "—", text_color=color.white, text_size=size.small, bgcolor=exp5m == 1 ? color.new(#089981, 40) : exp5m == -1 ? color.new(#f23645, 40) : color.new(color.gray, 85))
+        table.cell(infoTbl, 2, 3, exp15m == 1 ? "▲" : exp15m == -1 ? "▼" : "—", text_color=color.white, text_size=size.small, bgcolor=exp15m == 1 ? color.new(#089981, 40) : exp15m == -1 ? color.new(#f23645, 40) : color.new(color.gray, 85))
+        table.cell(infoTbl, 3, 3, exp1h == 1 ? "▲" : exp1h == -1 ? "▼" : "—", text_color=color.white, text_size=size.small, bgcolor=exp1h == 1 ? color.new(#089981, 40) : exp1h == -1 ? color.new(#f23645, 40) : color.new(color.gray, 85))
+        table.cell(infoTbl, 4, 3, exp4h == 1 ? "▲" : exp4h == -1 ? "▼" : "—", text_color=color.white, text_size=size.small, bgcolor=exp4h == 1 ? color.new(#089981, 40) : exp4h == -1 ? color.new(#f23645, 40) : color.new(color.gray, 85))
+
+        // Divergence row
+        string divSym = smtDivResult == 1 ? "▲" : smtDivResult == -1 ? "▼" : "—"
+        color  divBg  = smtDivResult == 1 ? color.new(#089981, 60) : smtDivResult == -1 ? color.new(#f23645, 60) : color.new(color.gray, 85)
+        table.cell(infoTbl, 0, 4, "Divergence", text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 85))
+        table.cell(infoTbl, 1, 4, divSym, text_color=txtColor, text_size=size.small, bgcolor=divBg)
+        table.cell(infoTbl, 2, 4, divSym, text_color=txtColor, text_size=size.small, bgcolor=divBg)
+        table.cell(infoTbl, 3, 4, divSym, text_color=txtColor, text_size=size.small, bgcolor=divBg)
+        table.cell(infoTbl, 4, 4, divSym, text_color=txtColor, text_size=size.small, bgcolor=divBg)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 14 — SIGNALS & AUTOMATION ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Visual Signal Plots ──────────────────────────────────────────────────────
+plotshape(i_sigShow and sigLong and i_sigStyle == "Triangle", title="Long Triangle",
+     style=shape.triangleup, location=location.belowbar, color=i_sigLongCol, size=size.small)
+plotshape(i_sigShow and sigShort and i_sigStyle == "Triangle", title="Short Triangle",
+     style=shape.triangledown, location=location.abovebar, color=i_sigShortCol, size=size.small)
+
+plotshape(i_sigShow and sigLong and i_sigStyle == "Arrow", title="Long Arrow",
+     style=shape.arrowup, location=location.belowbar, color=i_sigLongCol, size=size.small)
+plotshape(i_sigShow and sigShort and i_sigStyle == "Arrow", title="Short Arrow",
+     style=shape.arrowdown, location=location.abovebar, color=i_sigShortCol, size=size.small)
+
+// Dynamic PDI Labels when Style is "Label"
+if i_sigShow and i_sigStyle == "Label"
+    if sigLong
+        string pdiTxt = i_pdiEnable ? ("PDI BUY" + (pdiIsSTier ? " [S-Tier]\n" : "\n") + (not na(pdiCurRR) ? str.tostring(pdiCurRR, "#.#") + "R" : "")) : "BUY"
+        label.new(bar_index, low - ta.atr(14) * 0.4, pdiTxt, style=label.style_label_up, color=i_sigLongCol, textcolor=color.white, size=size.small)
+    if sigShort
+        string pdiTxt = i_pdiEnable ? ("PDI SELL" + (pdiIsSTier ? " [S-Tier]\n" : "\n") + (not na(pdiCurRR) ? str.tostring(pdiCurRR, "#.#") + "R" : "")) : "SELL"
+        label.new(bar_index, high + ta.atr(14) * 0.4, pdiTxt, style=label.style_label_down, color=i_sigShortCol, textcolor=color.white, size=size.small)
+
+// Exit / Stop Invalidation marks
+plotshape(i_sigShow and i_sigExitShow and sigExitLong, title="Exit Long (Invalidation)",
+     style=shape.xcross, location=location.abovebar, color=color.orange, size=size.tiny)
+plotshape(i_sigShow and i_sigExitShow and sigExitShort, title="Exit Short (Invalidation)",
+     style=shape.xcross, location=location.belowbar, color=color.orange, size=size.tiny)
+
+// ── Dedicated Automation Alertconditions ─────────────────────────────────────
+alertcondition(sigLong,      title="⚡ Long Entry Signal",   message="BUY {{ticker}} | Price: {{close}} | Interval: {{interval}}")
+alertcondition(sigShort,     title="⚡ Short Entry Signal",  message="SELL {{ticker}} | Price: {{close}} | Interval: {{interval}}")
+alertcondition(sigPdiLong,   title="⭐ PDI Long Setup",      message="PDI BUY {{ticker}} | Price: {{close}} | Interval: {{interval}}")
+alertcondition(sigPdiShort,  title="⭐ PDI Short Setup",     message="PDI SELL {{ticker}} | Price: {{close}} | Interval: {{interval}}")
+alertcondition(sigExitLong,  title="⚡ Exit Long (Stop)",    message="EXIT LONG {{ticker}} | Price: {{close}}")
+alertcondition(sigExitShort, title="⚡ Exit Short (Stop)",   message="EXIT SHORT {{ticker}} | Price: {{close}}")
+
+// Setup & Market Structure Alerts
+alertcondition(alertBullIfvg, title="Bullish +iFVG Inversion", message="Bullish +iFVG inversion detected on {{ticker}} {{interval}}")
+alertcondition(alertBearIfvg, title="Bearish -iFVG Inversion", message="Bearish -iFVG inversion detected on {{ticker}} {{interval}}")
+alertcondition(alertSweepHi,  title="Session High Swept",       message="Session high level swept on {{ticker}} {{interval}}")
+alertcondition(alertSweepLo,  title="Session Low Swept",        message="Session low level swept on {{ticker}} {{interval}}")
+
+// ── Dynamic alert() for Webhook Bots ─────────────────────────────────────────
+if sigLong
+    string alertMsg = "BUY " + syminfo.ticker + " @ " + str.tostring(close) + (i_pdiEnable and not na(pdiCurSL) ? (" | SL: " + str.tostring(pdiCurSL, "#.00") + " | TP: " + str.tostring(pdiCurTP, "#.00") + " | " + (pdiIsSTier ? "S-Tier" : "Standard")) : "")
+    alert(alertMsg, alert.freq_once_per_bar_close)
+if sigShort
+    string alertMsg = "SELL " + syminfo.ticker + " @ " + str.tostring(close) + (i_pdiEnable and not na(pdiCurSL) ? (" | SL: " + str.tostring(pdiCurSL, "#.00") + " | TP: " + str.tostring(pdiCurTP, "#.00") + " | " + (pdiIsSTier ? "S-Tier" : "Standard")) : "")
+    alert(alertMsg, alert.freq_once_per_bar_close)
+if sigExitLong
+    alert("EXIT LONG " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+if sigExitShort
+    alert("EXIT SHORT " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+// ═══════════════════════════════════════════════════════════════════════════════

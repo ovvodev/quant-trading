@@ -1,0 +1,929 @@
+//@version=6
+indicator("IFVG Pro v8", shorttitle="IFVG Pro v8", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KAIROS — comprehensive v8 signal, visual and execution indicator.
+//
+// Changes in v8 (bug fixes + signal improvements):
+//
+//   BUG FIXES:
+//   [#1] tfString now maps every standard TF correctly:
+//        "60" → "1H", "240" → "4H", "720" → "12H", etc.
+//   [#2] syminfo.ticker replaces syminfo.root — preserves contract suffixes.
+//   [#3] execInvLevel/execInvDir replaced by ExecInv[] array — multiple
+//        concurrent IFVG stops tracked independently.
+//   [#4] Session sweep detection decoupled from visual toggles — A+ gate
+//        works correctly even when lines are hidden.
+//   [#5] Alert extracted from inside the setup loop using a flag pattern.
+//
+//   SIGNAL IMPROVEMENTS:
+//   [S1] IFVG Retest Alert  — fires once when price re-enters a valid box.
+//   [S2] CE Touch Alert     — fires once when price touches the 50% midpoint.
+//   [S3] Session Sweep Alert— standalone alert on Asia/London/NY H or L sweep.
+//   [S4] HTF Bias Flip Alert— fires when 1H or 4H bias flips direction.
+//   [S5] Confluence score   — 0-5 integer added to every entry JSON payload.
+//   [S6] R:R ratio          — added to JSON when a target is known (A+).
+//
+// JSON payload (entry): secret, symbol, action, timeframe, ifvg_type,
+//   sl_price, c1_high, c1_low, swing_sl, entry_ref, imbalance,
+//   sweep_extreme, a_plus, a_plus_target, confluence, rr.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// =============================================================================
+// 1. INPUTS
+// =============================================================================
+
+grp_setup         = "IFVG Constraints"
+setupLookback     = input.int(20,  "Setup Sequence Lookback",           minval=5, maxval=60, group=grp_setup)
+lookForward       = input.int(5,   "Box Projection (Bars)",             minval=1, maxval=50, group=grp_setup)
+liqLookback       = input.int(20,  "Liquidity Scan Range",              minval=5,            group=grp_setup)
+showAplus         = input.bool(false, "Show A+ Setups Only",                                 group=grp_setup)
+minImbalanceTicks = input.int(0,   "Min Imbalance Size (ticks, 0=off)", minval=0,            group=grp_setup, tooltip="Skip alerting when the inversion gap is smaller than this many ticks. Drawings still appear.")
+
+grp_risk          = "Execution Risk"
+swingLookback     = input.int(15,  "Swing Lookback (bars)",  minval=2, maxval=200, group=grp_risk)
+swingBufferTicks  = input.int(0,   "Swing Stop Buffer (ticks)", minval=0,          group=grp_risk)
+showStopPlacement = input.bool(true, "Show A+ Initial + Swing Stops",              group=grp_risk)
+showInvalidation  = input.bool(true, "Show Structural Invalidation",               group=grp_risk)
+
+grp_vis      = "IFVG Visuals"
+themeMode    = input.string("Dark",  "Theme Mode",  options=["Dark","Light"], group=grp_vis)
+lblSizeInput = input.string("Small", "Label Size",  options=["Auto","Tiny","Small","Normal","Large","Huge"], group=grp_vis)
+showCE       = input.bool(true,  "Show CE (50%) Line",    group=grp_vis)
+bullColor    = input.color(color.new(color.green, 80), "Bullish Setup Color", group=grp_vis)
+bearColor    = input.color(color.new(color.red,   80), "Bearish Setup Color", group=grp_vis)
+failColor    = input.color(color.new(color.gray,  85), "Failed Setup Color",  group=grp_vis)
+delInvalid   = input.bool(false, "Delete Invalid Setups", group=grp_vis)
+
+grp_sess      = "Session Liquidity"
+tzChoice      = input.string("New York (ET)", "Session Timezone",
+     options=["Chart / Exchange time","New York (ET)","Chicago (CT)","London (GMT/BST)","Frankfurt (CET)","Dubai (GST)","Mumbai (IST)","Singapore (SGT)","Hong Kong (HKT)","Tokyo (JST)","Sydney (AET)","UTC"],
+     group=grp_sess, tooltip="Timezone the three session windows are interpreted in.")
+sessAsiaIn    = input.session("1900-2359", "Asian Session",    group=grp_sess)
+sessLondonIn  = input.session("0200-0500", "London Session",   group=grp_sess)
+sessNYIn      = input.session("0700-1000", "New York Session", group=grp_sess)
+showSessTimes = input.bool(true, "Show Session Times Table", group=grp_sess)
+sessTblPos    = input.string("Top Right", "Table Position", options=["Top Right","Top Left","Middle Right","Bottom Left"], group=grp_sess)
+showAsia      = input.bool(true, "Show Asian Liquidity Lines",  group=grp_sess)
+asiaColor     = input.color(color.blue,   "Asia Line Color",   group=grp_sess)
+showLondon    = input.bool(true, "Show London Liquidity Lines", group=grp_sess)
+londonColor   = input.color(color.orange, "London Line Color", group=grp_sess)
+showNY        = input.bool(true, "Show NY Liquidity Lines",     group=grp_sess)
+nyColor       = input.color(color.purple, "NY Line Color",      group=grp_sess)
+
+grp_alert     = "Alerts"
+alertMode     = input.string("Text", "Alert Type", options=["Text","Webhook JSON","Both"], group=grp_alert,
+     tooltip="Text = plain notification. Webhook JSON = machine-readable payload. Both = two messages per signal.")
+webhookSecret = input.string("", "Webhook Secret",         group=grp_alert, tooltip="Optional. Sent in JSON 'secret' field.")
+msgBull       = input.string("", "Custom Bullish Message", group=grp_alert)
+msgBear       = input.string("", "Custom Bearish Message", group=grp_alert)
+alertRetest   = input.bool(true,  "Alert on IFVG Retest",            group=grp_alert, tooltip="Fires once when price re-enters a valid IFVG box.")
+alertCETouch  = input.bool(true,  "Alert on CE (50%) Touch",         group=grp_alert, tooltip="Fires once when price touches the 50% midpoint of a valid IFVG.")
+alertSweep    = input.bool(true,  "Alert on Session Sweep",           group=grp_alert, tooltip="Fires when Asia/London/NY H or L is swept. Includes session, direction, level in JSON.")
+alertBiasFlip = input.bool(true,  "Alert on HTF Bias Flip (1H / 4H)",group=grp_alert, tooltip="Fires when the 1H or 4H FVG-bias column flips direction.")
+
+grp_liq       = "Pivot Sweeps"
+showLiquidity  = input.bool(false, "Show Pivot Sweeps", group=grp_liq)
+liqSensitivity = input.string("Low (3)", "Sensitivity", options=["Low (3)","Medium (5)","High (15)","Max (100)"], group=grp_liq)
+
+// =============================================================================
+// 2. CONFIG, TYPES & EARLY SECURITY CALLS
+// =============================================================================
+
+txtColor = themeMode == "Light" ? color.black : color.white
+
+string lblSize = switch lblSizeInput
+    "Auto"   => size.auto
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+    => size.small
+
+int liqLen = switch liqSensitivity
+    "Low (3)"    => 3
+    "Medium (5)" => 5
+    "High (15)"  => 15
+    "Max (100)"  => 100
+    => 3
+
+// FIX #1: proper TF string mapping (one case per line — Pine Script requirement)
+string tfString = switch timeframe.period
+    "1"   => "1m"
+    "2"   => "2m"
+    "3"   => "3m"
+    "5"   => "5m"
+    "10"  => "10m"
+    "15"  => "15m"
+    "20"  => "20m"
+    "30"  => "30m"
+    "45"  => "45m"
+    "60"  => "1H"
+    "120" => "2H"
+    "180" => "3H"
+    "240" => "4H"
+    "360" => "6H"
+    "480" => "8H"
+    "720" => "12H"
+    "1D"  => "1D"
+    "3D"  => "3D"
+    "1W"  => "1W"
+    "1M"  => "1M"
+    => timeframe.period
+
+// FIX #2: ticker preserves contract suffixes (e.g. ES1!)
+string symTicker = syminfo.ticker
+
+bool wantText = alertMode == "Text"         or alertMode == "Both"
+bool wantJson = alertMode == "Webhook JSON" or alertMode == "Both"
+
+// Updated type: retested + ceTouched for per-setup one-shot alert tracking
+type IfvgSetup
+    box   id
+    label lbl
+    line  ce
+    bool  isBullish
+    float realTop
+    float realBtm
+    bool  isValid
+    bool  retested    // [S1] true after retest alert fires
+    bool  ceTouched   // [S2] true after CE-touch alert fires
+
+var IfvgSetup[] activeSetups = array.new<IfvgSetup>()
+
+// A+ sweep bars — updated regardless of visual toggles (FIX #4)
+var int lastBullSweepBar = na
+var int lastBearSweepBar = na
+
+rangesOverlap(top1, btm1, top2, btm2) =>
+    math.max(btm1, btm2) < math.min(top1, top2)
+
+// FIX #3: array of ExecInv records replaces single level/dir pair
+type ExecInv
+    float level
+    int   dir
+
+var ExecInv[] execInvs = array.new<ExecInv>()
+
+swingBuf     = swingBufferTicks * syminfo.mintick
+swingSLLong  = ta.lowest(low,  swingLookback) - swingBuf
+swingSLShort = ta.highest(high, swingLookback) + swingBuf
+
+type ExecHtfFvg
+    float top
+    float btm
+    bool  isBull
+
+var array<ExecHtfFvg> execHtfFvgs = array.new<ExecHtfFvg>()
+
+f_execHtfFvg() =>
+    bool ib = low[1] > high[3]
+    bool ir = high[1] < low[3]
+    [ib, low[1], high[3], ir, low[3], high[1], time[3]]
+
+f_trackExecHtf(string tf) =>
+    [ib, bTop, bBtm, ir, sTop, sBtm, gapTime] = request.security(syminfo.tickerid, tf, f_execHtfFvg(), lookahead=barmerge.lookahead_on)
+    if gapTime != gapTime[1]
+        if ib
+            array.push(execHtfFvgs, ExecHtfFvg.new(bTop, bBtm, true))
+        if ir
+            array.push(execHtfFvgs, ExecHtfFvg.new(sTop, sBtm, false))
+
+f_trackExecHtf("15")
+f_trackExecHtf("60")
+
+if array.size(execHtfFvgs) > 0
+    for i = array.size(execHtfFvgs) - 1 to 0
+        ExecHtfFvg f = array.get(execHtfFvgs, i)
+        if (f.isBull and low <= f.btm) or (not f.isBull and high >= f.top)
+            array.remove(execHtfFvgs, i)
+while array.size(execHtfFvgs) > 40
+    array.shift(execHtfFvgs)
+
+f_execTargetAbove(float px) =>
+    float t = na
+    if array.size(execHtfFvgs) > 0
+        for i = 0 to array.size(execHtfFvgs) - 1
+            ExecHtfFvg f = array.get(execHtfFvgs, i)
+            if f.btm > px and (na(t) or f.btm < t)
+                t := f.btm
+    t
+
+f_execTargetBelow(float px) =>
+    float t = na
+    if array.size(execHtfFvgs) > 0
+        for i = 0 to array.size(execHtfFvgs) - 1
+            ExecHtfFvg f = array.get(execHtfFvgs, i)
+            if f.top < px and (na(t) or f.top > t)
+                t := f.top
+    t
+
+// --- HTF Bias (moved before Section 3 so confluence score can use it) ---
+f_calc_bias() =>
+    var array<float> gTop    = array.new<float>()
+    var array<float> gBtm    = array.new<float>()
+    var array<int>   gDir    = array.new<int>()
+    var array<bool>  gTested = array.new<bool>()
+
+    if low[1] > high[3]
+        array.push(gTop, low[1]),  array.push(gBtm, high[3])
+        array.push(gDir, 1),       array.push(gTested, false)
+    if high[1] < low[3]
+        array.push(gTop, low[3]),  array.push(gBtm, high[1])
+        array.push(gDir, -1),      array.push(gTested, false)
+
+    while array.size(gDir) > 40
+        array.shift(gTop), array.shift(gBtm)
+        array.shift(gDir), array.shift(gTested)
+
+    if array.size(gDir) > 0
+        for i = array.size(gDir) - 1 to 0
+            float gt = array.get(gTop, i)
+            float gb = array.get(gBtm, i)
+            int   gd = array.get(gDir, i)
+            bool dead = gd == 1 ? close[1] < gb : close[1] > gt
+            if dead
+                array.remove(gTop, i), array.remove(gBtm, i)
+                array.remove(gDir, i), array.remove(gTested, i)
+            else
+                if gd == 1 ? low[1] < gt : high[1] > gb
+                    array.set(gTested, i, true)
+
+    int bias = 0
+    if array.size(gDir) > 0
+        for i = array.size(gDir) - 1 to 0
+            if array.get(gTested, i)
+                bias := array.get(gDir, i)
+                break
+    bias
+
+int bias5m  = request.security(syminfo.tickerid, "5",   f_calc_bias(), lookahead=barmerge.lookahead_on)
+int bias15m = request.security(syminfo.tickerid, "15",  f_calc_bias(), lookahead=barmerge.lookahead_on)
+int bias1h  = request.security(syminfo.tickerid, "60",  f_calc_bias(), lookahead=barmerge.lookahead_on)
+int bias4h  = request.security(syminfo.tickerid, "240", f_calc_bias(), lookahead=barmerge.lookahead_on)
+int bias12h = request.security(syminfo.tickerid, "720", f_calc_bias(), lookahead=barmerge.lookahead_on)
+
+// --- Session timezone ---
+string sessTz = switch tzChoice
+    "Chart / Exchange time" => syminfo.timezone
+    "New York (ET)"         => "America/New_York"
+    "Chicago (CT)"          => "America/Chicago"
+    "London (GMT/BST)"      => "Europe/London"
+    "Frankfurt (CET)"       => "Europe/Berlin"
+    "Dubai (GST)"           => "Asia/Dubai"
+    "Mumbai (IST)"          => "Asia/Kolkata"
+    "Singapore (SGT)"       => "Asia/Singapore"
+    "Hong Kong (HKT)"       => "Asia/Hong_Kong"
+    "Tokyo (JST)"           => "Asia/Tokyo"
+    "Sydney (AET)"          => "Australia/Sydney"
+    "UTC"                   => "UTC"
+    => "America/New_York"
+
+// =============================================================================
+// 3. IFVG CORE LOGIC (STRICT: CANDLE-3 + OVERLAP + SWEEP)
+// =============================================================================
+
+isBullFVG = low  > high[2]
+isBearFVG = high < low[2]
+
+// FIX #5: flag pattern — alert called once AFTER the loop
+if barstate.isconfirmed and (isBullFVG or isBearFVG)
+    newTop = isBullFVG ? low   : low[2]
+    newBtm = isBullFVG ? high[2] : high
+
+    bool  af_bull          = false
+    bool  af_bear          = false
+    float af_invGap        = na
+    bool  af_isAplus       = false
+    float af_c1High        = na
+    float af_c1Low         = na
+    float af_initialSL     = na
+    float af_swingSL       = na
+    float af_aplusTarget   = na
+    float af_sweepExtreme  = na
+
+    for i = 1 to setupLookback
+        bool oldIsBull = low[i]  > high[i+2]
+        bool oldIsBear = high[i] < low[i+2]
+
+        if (isBullFVG and oldIsBear) or (isBearFVG and oldIsBull)
+            oldTop = oldIsBull ? low[i]    : low[i+2]
+            oldBtm = oldIsBull ? high[i+2] : high[i]
+
+            if rangesOverlap(newTop, newBtm, oldTop, oldBtm)
+                bool  sweepFound   = false
+                float sweepExtreme = na
+
+                if isBullFVG
+                    float lowestInSeq = low
+                    for k = 0 to i
+                        lowestInSeq := math.min(lowestInSeq, low[k])
+                    float preExistingLow = low[i+1]
+                    for k = 1 to liqLookback
+                        preExistingLow := math.min(preExistingLow, low[i+k])
+                    if lowestInSeq < preExistingLow
+                        sweepFound := true
+                    sweepExtreme := lowestInSeq
+                else
+                    float highestInSeq = high
+                    for k = 0 to i
+                        highestInSeq := math.max(highestInSeq, high[k])
+                    float preExistingHigh = high[i+1]
+                    for k = 1 to liqLookback
+                        preExistingHigh := math.max(preExistingHigh, high[i+k])
+                    if highestInSeq > preExistingHigh
+                        sweepFound := true
+                    sweepExtreme := highestInSeq
+
+                if sweepFound
+                    bool isAplus = isBullFVG
+                         ? (not na(lastBullSweepBar) and (bar_index - lastBullSweepBar) <= setupLookback)
+                         : (not na(lastBearSweepBar) and (bar_index - lastBearSweepBar) <= setupLookback)
+                    bool aplus_ok = not showAplus or isAplus
+
+                    if aplus_ok
+                        color  boxColor  = isBullFVG ? bullColor : bearColor
+                        string txtSymbol = (isAplus ? "A+ " : "") + (isBullFVG ? "+IFVG" : "-IFVG")
+                        float  visTop    = math.min(oldTop, newTop)
+                        float  visBtm   = math.max(oldBtm, newBtm)
+                        float  midPoint  = (visTop + visBtm) / 2
+
+                        box b = box.new(left=bar_index[i+2], top=visTop, bottom=visBtm, right=bar_index + lookForward, border_color=boxColor, bgcolor=boxColor)
+                        label l = label.new(bar_index + lookForward, midPoint, txtSymbol, color=color.new(color.white, 100), textcolor=txtColor, style=label.style_none, size=lblSize)
+
+                        line ceLine = na
+                        if showCE
+                            ceLine := line.new(bar_index[i+2], midPoint, bar_index + lookForward, midPoint, color=color.new(txtColor, 50), style=line.style_dashed)
+
+                        array.push(activeSetups, IfvgSetup.new(b, l, ceLine, isBullFVG, visTop, visBtm, true, false, false))
+
+                        float invGap = oldTop - oldBtm
+                        if invGap >= minImbalanceTicks * syminfo.mintick
+                            if isBullFVG
+                                af_bull := true
+                            else
+                                af_bear := true
+                            af_invGap      := invGap
+                            af_isAplus     := isAplus
+                            af_c1High      := high[2]
+                            af_c1Low       := low[2]
+                            af_initialSL   := isBullFVG ? low[2]  : high[2]
+                            af_swingSL     := isBullFVG ? swingSLLong : swingSLShort
+                            af_sweepExtreme := sweepExtreme
+                            af_aplusTarget := isAplus ? (isBullFVG ? f_execTargetAbove(close) : f_execTargetBelow(close)) : na
+
+                    break
+
+    // Fire alerts once after the loop
+    if af_bull or af_bear
+        string actionTxt = af_bull ? "buy"    : "sell"
+        string ifvgTyp   = af_bull ? "Bullish" : "Bearish"
+        int    sigDir    = af_bull ? 1 : -1
+
+        // [S5] Confluence score 0-5
+        bool inAnySession = not na(time(timeframe.period, sessAsiaIn, sessTz)) or not na(time(timeframe.period, sessLondonIn, sessTz)) or not na(time(timeframe.period, sessNYIn, sessTz))
+        int confluence = 0
+        if af_isAplus
+            confluence += 1
+        if inAnySession
+            confluence += 1
+        if minImbalanceTicks > 0 and af_invGap >= 2 * minImbalanceTicks * syminfo.mintick
+            confluence += 1
+        if bias1h == sigDir
+            confluence += 1
+        if bias4h == sigDir
+            confluence += 1
+
+        // [S6] R:R ratio
+        float rrRatio = na
+        if af_isAplus and not na(af_aplusTarget) and not na(af_initialSL)
+            float risk   = math.abs(close - af_initialSL)
+            float reward = math.abs(af_aplusTarget - close)
+            if risk > 0
+                rrRatio := reward / risk
+
+        if wantText
+            string defaultTxt = ifvgTyp + " IFVG Detected!"
+            string customTxt  = af_bull ? msgBull : msgBear
+            alert(str.length(customTxt) > 0 ? customTxt : defaultTxt, alert.freq_once_per_bar_close)
+
+        if wantJson
+            string rrStr  = not na(rrRatio) ? str.tostring(rrRatio, "#.##") : "0"
+            string tgtStr = af_isAplus and not na(af_aplusTarget) ? str.tostring(af_aplusTarget, "#.00") : "0"
+            alert('{"secret":"'         + webhookSecret
+                 + '","symbol":"'       + symTicker
+                 + '","action":"'       + actionTxt
+                 + '","timeframe":"'    + tfString
+                 + '","ifvg_type":"'    + ifvgTyp
+                 + '","sl_price":'      + str.tostring(af_initialSL,    "#.00")
+                 + ',"c1_high":'        + str.tostring(af_c1High,       "#.00")
+                 + ',"c1_low":'         + str.tostring(af_c1Low,        "#.00")
+                 + ',"swing_sl":'       + str.tostring(af_swingSL,      "#.00")
+                 + ',"entry_ref":'      + str.tostring(close,           "#.00")
+                 + ',"imbalance":'      + str.tostring(af_invGap / syminfo.mintick, "#.##")
+                 + ',"sweep_extreme":'  + str.tostring(af_sweepExtreme, "#.00")
+                 + ',"a_plus":'         + (af_isAplus ? "true" : "false")
+                 + ',"a_plus_target":'  + tgtStr
+                 + ',"confluence":'     + str.tostring(confluence)
+                 + ',"rr":'             + rrStr
+                 + '}', alert.freq_once_per_bar_close)
+
+        // Register stop in the array (FIX #3)
+        array.push(execInvs, ExecInv.new(af_initialSL, sigDir))
+        while array.size(execInvs) > 10
+            array.shift(execInvs)
+
+        if af_isAplus and showStopPlacement
+            line.new(bar_index, af_initialSL, bar_index + lookForward, af_initialSL, color=color.new(color.orange, 0), width=2)
+            label.new(bar_index + lookForward, af_initialSL, "A+ C1 SL", style=label.style_label_left, textcolor=color.white, color=color.new(color.orange, 20), size=size.tiny)
+            line.new(bar_index, af_swingSL, bar_index + lookForward, af_swingSL, color=color.new(color.red, 0), width=2, style=line.style_dashed)
+            label.new(bar_index + lookForward, af_swingSL, "A+ swing", style=label.style_label_left, textcolor=color.white, color=color.new(color.red, 20), size=size.tiny)
+
+// FIX #3: Iterate ALL active ExecInv records for invalidation
+if barstate.isconfirmed and array.size(execInvs) > 0
+    for i = array.size(execInvs) - 1 to 0
+        ExecInv inv = array.get(execInvs, i)
+        bool triggered = (inv.dir == 1 and close < inv.level) or (inv.dir == -1 and close > inv.level)
+        if triggered
+            if wantJson
+                string invDir = inv.dir == 1 ? "bullish" : "bearish"
+                alert('{"secret":"'   + webhookSecret
+                     + '","symbol":"' + symTicker
+                     + '","action":"exit","timeframe":"' + tfString
+                     + '","reason":"' + invDir + ' IFVG invalidated after candle-3 confirmation"}'
+                     , alert.freq_once_per_bar_close)
+            if showInvalidation
+                line.new(bar_index, close, bar_index + 3, close, color=txtColor, width=2)
+                label.new(bar_index + 3, close, "invalidated", style=label.style_none, textcolor=txtColor, size=size.tiny)
+            array.remove(execInvs, i)
+
+// =============================================================================
+// 4. INVALIDATION MANAGEMENT + [S1] RETEST + [S2] CE TOUCH ALERTS
+// =============================================================================
+
+if array.size(activeSetups) > 0
+    for i = array.size(activeSetups) - 1 to 0
+        s = array.get(activeSetups, i)
+
+        if s.isValid and barstate.isconfirmed
+            bool failed = s.isBullish ? close < s.realBtm : close > s.realTop
+
+            if failed
+                if delInvalid
+                    box.delete(s.id)
+                    label.delete(s.lbl)
+                    line.delete(s.ce)
+                    array.remove(activeSetups, i)
+                else
+                    box.set_bgcolor(s.id, failColor)
+                    box.set_border_color(s.id, failColor)
+                    label.set_textcolor(s.lbl, color.new(txtColor, 50))
+                    line.delete(s.ce)
+                    s.isValid := false
+                    array.set(activeSetups, i, s)
+
+            else
+                // [S1] IFVG Retest — fires once when price re-enters the box
+                if not s.retested
+                    bool retestBull = s.isBullish      and low  <= s.realTop and close >= s.realBtm
+                    bool retestBear = not s.isBullish  and high >= s.realBtm and close <= s.realTop
+                    if retestBull or retestBear
+                        s.retested := true
+                        array.set(activeSetups, i, s)
+                        if alertRetest
+                            string rDir = s.isBullish ? "Bullish" : "Bearish"
+                            if wantText
+                                alert(rDir + " IFVG Retest — price re-entered the gap!", alert.freq_once_per_bar_close)
+                            if wantJson
+                                alert('{"secret":"'      + webhookSecret
+                                     + '","symbol":"'    + symTicker
+                                     + '","action":"retest","timeframe":"' + tfString
+                                     + '","ifvg_type":"' + rDir
+                                     + '","box_top":'    + str.tostring(s.realTop, "#.00")
+                                     + ',"box_btm":'     + str.tostring(s.realBtm, "#.00")
+                                     + ',"ce":'          + str.tostring((s.realTop + s.realBtm) / 2, "#.00")
+                                     + '}', alert.freq_once_per_bar_close)
+
+                // [S2] CE Touch — fires once when price wicks to the 50% midpoint
+                if not s.ceTouched
+                    float ceMid    = (s.realTop + s.realBtm) / 2
+                    float ceTol    = syminfo.mintick * 2
+                    bool ceTchBull = s.isBullish     and low  <= ceMid + ceTol
+                    bool ceTchBear = not s.isBullish and high >= ceMid - ceTol
+                    if ceTchBull or ceTchBear
+                        s.ceTouched := true
+                        array.set(activeSetups, i, s)
+                        if alertCETouch
+                            string cDir = s.isBullish ? "Bullish" : "Bearish"
+                            if wantText
+                                alert(cDir + " IFVG CE Touch — price at the 50% midpoint!", alert.freq_once_per_bar_close)
+                            if wantJson
+                                alert('{"secret":"'      + webhookSecret
+                                     + '","symbol":"'    + symTicker
+                                     + '","action":"ce_touch","timeframe":"' + tfString
+                                     + '","ifvg_type":"' + cDir
+                                     + '","ce_price":'   + str.tostring(ceMid, "#.00")
+                                     + '}', alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 5. PIVOT SWEEPS (LEGACY)
+// =============================================================================
+
+if showLiquidity
+    ph = ta.pivothigh(high, liqLen, liqLen)
+    pl = ta.pivotlow(low,  liqLen, liqLen)
+    var float activePH_Price = na, var int activePH_Index = na
+    var float activePL_Price = na, var int activePL_Index = na
+
+    if not na(ph)
+        activePH_Price := ph, activePH_Index := bar_index[liqLen]
+    if not na(pl)
+        activePL_Price := pl, activePL_Index := bar_index[liqLen]
+
+    if not na(activePH_Price) and high > activePH_Price
+        line.new(activePH_Index, activePH_Price, bar_index, activePH_Price, color=color.new(color.gray, 50))
+        label.new(activePH_Index, activePH_Price, "x", style=label.style_none, textcolor=color.gray, size=size.tiny)
+        activePH_Price := na
+
+    if not na(activePL_Price) and low < activePL_Price
+        line.new(activePL_Index, activePL_Price, bar_index, activePL_Price, color=color.new(color.gray, 50))
+        label.new(activePL_Index, activePL_Price, "x", yloc=yloc.price, style=label.style_none, textcolor=color.gray, size=size.tiny)
+        activePL_Price := na
+
+// =============================================================================
+// 6. SESSION ORIGIN LINES + SWEEP DETECTION + [S3] SWEEP ALERTS
+// =============================================================================
+// FIX #4: sweep detection (lastBullSweepBar / lastBearSweepBar) is now
+// unconditional — visual line updates are still gated by showXxx, but the
+// sweep state is always updated regardless of those toggles.
+
+string TIME_ASIA   = sessAsiaIn
+string TIME_LONDON = sessLondonIn
+string TIME_NY     = sessNYIn
+
+var line  asiaHighLine = na,  var line  asiaLowLine  = na
+var int   asiaHighIdx  = na,  var int   asiaLowIdx   = na
+var float asiaHighVal  = na,  var float asiaLowVal   = na
+var bool  asiaHSwept   = false, var bool asiaLSwept  = false
+
+var line  londonHighLine = na, var line  londonLowLine  = na
+var int   londonHighIdx  = na, var int   londonLowIdx   = na
+var float londonHighVal  = na, var float londonLowVal   = na
+var bool  londonHSwept   = false, var bool londonLSwept = false
+
+var line  nyHighLine = na, var line  nyLowLine  = na
+var int   nyHighIdx  = na, var int   nyLowIdx   = na
+var float nyHighVal  = na, var float nyLowVal   = na
+var bool  nyHSwept   = false, var bool nyLSwept = false
+
+// --- ASIA ---
+bool inAsia = not na(time(timeframe.period, TIME_ASIA, sessTz))
+
+if inAsia
+    if not inAsia[1]
+        asiaHighVal := high, asiaLowVal := low
+        asiaHighIdx := bar_index, asiaLowIdx := bar_index
+        asiaHSwept := false, asiaLSwept := false
+        if showAsia
+            asiaHighLine := line.new(bar_index, high, bar_index, high, style=line.style_dashed, color=asiaColor)
+            asiaLowLine  := line.new(bar_index, low,  bar_index, low,  style=line.style_dashed, color=asiaColor)
+    else
+        if high >= asiaHighVal
+            asiaHighVal := high, asiaHighIdx := bar_index
+            if showAsia and not na(asiaHighLine)
+                line.set_xy1(asiaHighLine, asiaHighIdx, asiaHighVal)
+                line.set_xy2(asiaHighLine, bar_index,   asiaHighVal)
+        else
+            if showAsia and not na(asiaHighLine)
+                line.set_x2(asiaHighLine, bar_index)
+        if low <= asiaLowVal
+            asiaLowVal := low, asiaLowIdx := bar_index
+            if showAsia and not na(asiaLowLine)
+                line.set_xy1(asiaLowLine, asiaLowIdx, asiaLowVal)
+                line.set_xy2(asiaLowLine, bar_index,  asiaLowVal)
+        else
+            if showAsia and not na(asiaLowLine)
+                line.set_x2(asiaLowLine, bar_index)
+else
+    if not na(asiaHighVal) and not asiaHSwept
+        if showAsia and not na(asiaHighLine)
+            line.set_x2(asiaHighLine, bar_index)
+        if high > asiaHighVal
+            asiaHSwept := true, lastBearSweepBar := bar_index
+            if alertSweep
+                if wantText
+                    alert("Asia High Swept — watch for Bearish IFVG", alert.freq_once_per_bar_close)
+                if wantJson
+                    alert('{"secret":"'     + webhookSecret + '","symbol":"' + symTicker
+                         + '","action":"session_sweep","timeframe":"' + tfString
+                         + '","session":"Asia","sweep":"high","level":' + str.tostring(asiaHighVal, "#.00") + '}', alert.freq_once_per_bar_close)
+    if not na(asiaLowVal) and not asiaLSwept
+        if showAsia and not na(asiaLowLine)
+            line.set_x2(asiaLowLine, bar_index)
+        if low < asiaLowVal
+            asiaLSwept := true, lastBullSweepBar := bar_index
+            if alertSweep
+                if wantText
+                    alert("Asia Low Swept — watch for Bullish IFVG", alert.freq_once_per_bar_close)
+                if wantJson
+                    alert('{"secret":"'     + webhookSecret + '","symbol":"' + symTicker
+                         + '","action":"session_sweep","timeframe":"' + tfString
+                         + '","session":"Asia","sweep":"low","level":' + str.tostring(asiaLowVal, "#.00") + '}', alert.freq_once_per_bar_close)
+
+// --- LONDON ---
+bool inLondon = not na(time(timeframe.period, TIME_LONDON, sessTz))
+
+if inLondon
+    if not inLondon[1]
+        londonHighVal := high, londonLowVal := low
+        londonHighIdx := bar_index, londonLowIdx := bar_index
+        londonHSwept := false, londonLSwept := false
+        if showLondon
+            londonHighLine := line.new(bar_index, high, bar_index, high, style=line.style_dashed, color=londonColor)
+            londonLowLine  := line.new(bar_index, low,  bar_index, low,  style=line.style_dashed, color=londonColor)
+    else
+        if high >= londonHighVal
+            londonHighVal := high, londonHighIdx := bar_index
+            if showLondon and not na(londonHighLine)
+                line.set_xy1(londonHighLine, londonHighIdx, londonHighVal)
+                line.set_xy2(londonHighLine, bar_index,     londonHighVal)
+        else
+            if showLondon and not na(londonHighLine)
+                line.set_x2(londonHighLine, bar_index)
+        if low <= londonLowVal
+            londonLowVal := low, londonLowIdx := bar_index
+            if showLondon and not na(londonLowLine)
+                line.set_xy1(londonLowLine, londonLowIdx, londonLowVal)
+                line.set_xy2(londonLowLine, bar_index,    londonLowVal)
+        else
+            if showLondon and not na(londonLowLine)
+                line.set_x2(londonLowLine, bar_index)
+else
+    if not na(londonHighVal) and not londonHSwept
+        if showLondon and not na(londonHighLine)
+            line.set_x2(londonHighLine, bar_index)
+        if high > londonHighVal
+            londonHSwept := true, lastBearSweepBar := bar_index
+            if alertSweep
+                if wantText
+                    alert("London High Swept — watch for Bearish IFVG", alert.freq_once_per_bar_close)
+                if wantJson
+                    alert('{"secret":"'     + webhookSecret + '","symbol":"' + symTicker
+                         + '","action":"session_sweep","timeframe":"' + tfString
+                         + '","session":"London","sweep":"high","level":' + str.tostring(londonHighVal, "#.00") + '}', alert.freq_once_per_bar_close)
+    if not na(londonLowVal) and not londonLSwept
+        if showLondon and not na(londonLowLine)
+            line.set_x2(londonLowLine, bar_index)
+        if low < londonLowVal
+            londonLSwept := true, lastBullSweepBar := bar_index
+            if alertSweep
+                if wantText
+                    alert("London Low Swept — watch for Bullish IFVG", alert.freq_once_per_bar_close)
+                if wantJson
+                    alert('{"secret":"'     + webhookSecret + '","symbol":"' + symTicker
+                         + '","action":"session_sweep","timeframe":"' + tfString
+                         + '","session":"London","sweep":"low","level":' + str.tostring(londonLowVal, "#.00") + '}', alert.freq_once_per_bar_close)
+
+// --- NY ---
+bool inNY = not na(time(timeframe.period, TIME_NY, sessTz))
+
+if inNY
+    if not inNY[1]
+        nyHighVal := high, nyLowVal := low
+        nyHighIdx := bar_index, nyLowIdx := bar_index
+        nyHSwept := false, nyLSwept := false
+        if showNY
+            nyHighLine := line.new(bar_index, high, bar_index, high, style=line.style_dashed, color=nyColor)
+            nyLowLine  := line.new(bar_index, low,  bar_index, low,  style=line.style_dashed, color=nyColor)
+    else
+        if high >= nyHighVal
+            nyHighVal := high, nyHighIdx := bar_index
+            if showNY and not na(nyHighLine)
+                line.set_xy1(nyHighLine, nyHighIdx, nyHighVal)
+                line.set_xy2(nyHighLine, bar_index, nyHighVal)
+        else
+            if showNY and not na(nyHighLine)
+                line.set_x2(nyHighLine, bar_index)
+        if low <= nyLowVal
+            nyLowVal := low, nyLowIdx := bar_index
+            if showNY and not na(nyLowLine)
+                line.set_xy1(nyLowLine, nyLowIdx, nyLowVal)
+                line.set_xy2(nyLowLine, bar_index, nyLowVal)
+        else
+            if showNY and not na(nyLowLine)
+                line.set_x2(nyLowLine, bar_index)
+else
+    if not na(nyHighVal) and not nyHSwept
+        if showNY and not na(nyHighLine)
+            line.set_x2(nyHighLine, bar_index)
+        if high > nyHighVal
+            nyHSwept := true, lastBearSweepBar := bar_index
+            if alertSweep
+                if wantText
+                    alert("NY High Swept — watch for Bearish IFVG", alert.freq_once_per_bar_close)
+                if wantJson
+                    alert('{"secret":"'     + webhookSecret + '","symbol":"' + symTicker
+                         + '","action":"session_sweep","timeframe":"' + tfString
+                         + '","session":"NY","sweep":"high","level":' + str.tostring(nyHighVal, "#.00") + '}', alert.freq_once_per_bar_close)
+    if not na(nyLowVal) and not nyLSwept
+        if showNY and not na(nyLowLine)
+            line.set_x2(nyLowLine, bar_index)
+        if low < nyLowVal
+            nyLSwept := true, lastBullSweepBar := bar_index
+            if alertSweep
+                if wantText
+                    alert("NY Low Swept — watch for Bullish IFVG", alert.freq_once_per_bar_close)
+                if wantJson
+                    alert('{"secret":"'     + webhookSecret + '","symbol":"' + symTicker
+                         + '","action":"session_sweep","timeframe":"' + tfString
+                         + '","session":"NY","sweep":"low","level":' + str.tostring(nyLowVal, "#.00") + '}', alert.freq_once_per_bar_close)
+
+// --- Session Times Table ---
+f_sessWindow(string sess) =>
+    string core = str.contains(sess, ":") ? array.get(str.split(sess, ":"), 0) : sess
+    array<string> parts = str.split(core, "-")
+    string outTxt = sess
+    if array.size(parts) == 2
+        string a = array.get(parts, 0)
+        string b = array.get(parts, 1)
+        if str.length(a) == 4 and str.length(b) == 4
+            outTxt := str.substring(a, 0, 2) + ":" + str.substring(a, 2, 4) + " - " +
+                      str.substring(b, 0, 2) + ":" + str.substring(b, 2, 4)
+    outTxt
+
+sessTblPosition = switch sessTblPos
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Middle Right" => position.middle_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+var table sessTbl = table.new(sessTblPosition, 2, 4, border_width=1, border_color=color.new(color.gray, 70))
+
+f_sessRow(int row, string sessName, string winTxt, color sessCol, bool enabled) =>
+    color nameBg = enabled ? color.new(sessCol, 60) : color.new(color.gray, 85)
+    color txtCol = enabled ? txtColor : color.new(txtColor, 55)
+    table.cell(sessTbl, 0, row, sessName, text_color=txtCol, text_size=size.small, bgcolor=nameBg)
+    table.cell(sessTbl, 1, row, winTxt,   text_color=txtCol, text_size=size.small, bgcolor=color.new(color.gray, 85))
+
+if showSessTimes and barstate.islast
+    table.cell(sessTbl, 0, 0, "Session", text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+    table.cell(sessTbl, 1, 0, tzChoice,  text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+    f_sessRow(1, "Asian",    f_sessWindow(TIME_ASIA),   asiaColor,   showAsia)
+    f_sessRow(2, "London",   f_sessWindow(TIME_LONDON), londonColor, showLondon)
+    f_sessRow(3, "New York", f_sessWindow(TIME_NY),     nyColor,     showNY)
+
+// =============================================================================
+// 7. HTF FVG OVERLAY (FILLED + UNFILLED)
+// =============================================================================
+
+grp_htf     = "HTF FVG Overlay"
+show15m     = input.bool(true,  "Show 15m FVGs", group=grp_htf)
+show1h      = input.bool(true,  "Show 1h FVGs",  group=grp_htf)
+show4h      = input.bool(true,  "Show 4h FVGs",  group=grp_htf)
+showUnfBull = input.bool(true,  "Unfilled Bullish HTF FVG", group=grp_htf, inline="ub", tooltip="Count applies per timeframe.")
+cntUnfBull  = input.int(3, "Show last", options=[1,3,5], group=grp_htf, inline="ub")
+showUnfBear = input.bool(true,  "Unfilled Bearish HTF FVG", group=grp_htf, inline="ur")
+cntUnfBear  = input.int(3, "Show last", options=[1,3,5], group=grp_htf, inline="ur")
+showFilBull = input.bool(false, "Filled Bullish HTF FVG",   group=grp_htf, inline="fb", tooltip="Ranked by fill time, not formation.")
+cntFilBull  = input.int(1, "Show last", options=[1,3,5], group=grp_htf, inline="fb")
+showFilBear = input.bool(false, "Filled Bearish HTF FVG",   group=grp_htf, inline="fr")
+cntFilBear  = input.int(1, "Show last", options=[1,3,5], group=grp_htf, inline="fr")
+
+htfBullColor  = color.new(bullColor, 88), htfBearColor  = color.new(bearColor, 88)
+htfBullFilled = color.new(bullColor, 95), htfBearFilled = color.new(bearColor, 95)
+htfBullEdge   = color.new(bullColor, 55), htfBearEdge   = color.new(bearColor, 55)
+
+int HTF_TRACK_MAX = 20
+
+type HtfFvg
+    box    id
+    label  lbl
+    float  top
+    float  btm
+    bool   isBull
+    int    startTime
+    bool   filled
+    int    fillTime
+    int    tfIdx
+    string tfLabel
+
+var array<HtfFvg> arrHtfFvgs = array.new<HtfFvg>()
+
+int htfRightX = time + nz(time - time[1], 60000) * 10
+
+f_calc_htf_fvg() =>
+    bool isBull = low[1] > high[3], bool isBear = high[1] < low[3]
+    [isBull, low[1], high[3], isBear, low[3], high[1], time[3]]
+
+f_htf_track(bool en, bool changed, bool isBull, float bT, float bB, bool isBear, float sT, float sB, int gt, int tfIdx, string tfLbl) =>
+    if en and changed
+        if isBull
+            array.push(arrHtfFvgs, HtfFvg.new(na, na, bT, bB, true,  gt, false, na, tfIdx, tfLbl))
+        if isBear
+            array.push(arrHtfFvgs, HtfFvg.new(na, na, sT, sB, false, gt, false, na, tfIdx, tfLbl))
+
+[bl15,  bt15,  bb15,  br15,  st15,  sb15,  gt15]  = request.security(syminfo.tickerid, "15",  f_calc_htf_fvg(), lookahead=barmerge.lookahead_on)
+[bl60,  bt60,  bb60,  br60,  st60,  sb60,  gt60]  = request.security(syminfo.tickerid, "60",  f_calc_htf_fvg(), lookahead=barmerge.lookahead_on)
+[bl240, bt240, bb240, br240, st240, sb240, gt240]  = request.security(syminfo.tickerid, "240", f_calc_htf_fvg(), lookahead=barmerge.lookahead_on)
+
+f_htf_track(show15m, gt15  != gt15[1],  bl15,  bt15,  bb15,  br15,  st15,  sb15,  gt15,  0, "15m")
+f_htf_track(show1h,  gt60  != gt60[1],  bl60,  bt60,  bb60,  br60,  st60,  sb60,  gt60,  1, "1H")
+f_htf_track(show4h,  gt240 != gt240[1], bl240, bt240, bb240, br240, st240, sb240, gt240, 2, "4H")
+
+f_htfShown(bool isBull, bool filled) =>
+    filled ? (isBull ? showFilBull : showFilBear) : (isBull ? showUnfBull : showUnfBear)
+f_htfLimit(bool isBull, bool filled) =>
+    filled ? (isBull ? cntFilBull : cntFilBear)  : (isBull ? cntUnfBull  : cntUnfBear)
+
+f_htfDraw(HtfFvg f) =>
+    color  fillCol   = f.isBull ? (f.filled ? htfBullFilled : htfBullColor) : (f.filled ? htfBearFilled : htfBearColor)
+    color  edgeCol   = f.filled ? (f.isBull ? htfBullEdge : htfBearEdge) : fillCol
+    string edgeStyle = f.filled ? line.style_dotted : line.style_solid
+    int    rightX    = f.filled ? f.fillTime : htfRightX
+    string txt       = f.tfLabel + (f.isBull ? " Bullish FVG" : " Bearish FVG") + (f.filled ? " (Filled)" : "")
+    color  txtCol    = f.filled ? color.new(txtColor, 40) : txtColor
+    if na(f.id)
+        f.id  := box.new(left=f.startTime, top=f.top, bottom=f.btm, right=rightX, xloc=xloc.bar_time, border_color=edgeCol, bgcolor=fillCol, border_style=edgeStyle)
+        f.lbl := label.new(x=rightX, y=(f.top+f.btm)/2, text=txt, xloc=xloc.bar_time, style=label.style_none, textcolor=txtCol, textalign=text.align_left, size=size.small)
+    else
+        box.set_bgcolor(f.id, fillCol), box.set_border_color(f.id, edgeCol), box.set_border_style(f.id, edgeStyle), box.set_right(f.id, rightX)
+        label.set_x(f.lbl, rightX), label.set_text(f.lbl, txt), label.set_textcolor(f.lbl, txtCol)
+    true
+
+f_htfErase(HtfFvg f) =>
+    box.delete(f.id), label.delete(f.lbl)
+    f.id := na, f.lbl := na
+    true
+
+int htfIdx = 0
+while htfIdx < array.size(arrHtfFvgs)
+    HtfFvg f = array.get(arrHtfFvgs, htfIdx)
+    bool moved = false
+    if not f.filled
+        if (f.isBull ? low <= f.btm : high >= f.top)
+            f.filled := true, f.fillTime := time
+            array.remove(arrHtfFvgs, htfIdx)
+            array.push(arrHtfFvgs, f)
+            moved := true
+    if not moved
+        htfIdx += 1
+
+if array.size(arrHtfFvgs) > 0
+    array<int> htfSeen = array.new<int>(12, 0)
+    for i = array.size(arrHtfFvgs) - 1 to 0
+        HtfFvg f = array.get(arrHtfFvgs, i)
+        int bkt  = f.tfIdx * 4 + (f.isBull ? 0 : 2) + (f.filled ? 1 : 0)
+        int rank = array.get(htfSeen, bkt) + 1
+        array.set(htfSeen, bkt, rank)
+        bool keep = f_htfShown(f.isBull, f.filled) and rank <= f_htfLimit(f.isBull, f.filled)
+        if keep
+            f_htfDraw(f)
+        else
+            f_htfErase(f)
+        if not keep and (f.filled or rank > HTF_TRACK_MAX)
+            array.remove(arrHtfFvgs, i)
+
+// =============================================================================
+// 8. HTF BIAS TABLE + [S4] BIAS FLIP ALERT
+// =============================================================================
+// Bias values were computed in Section 2. This section handles the flip alert
+// and the table display.
+
+grp_bias = "HTF Bias"
+showBias = input.bool(true, "Show HTF Bias Table", group=grp_bias)
+
+// [S4] HTF Bias Flip Alert — fires on confirmed direction change (not through neutral)
+if barstate.isconfirmed and alertBiasFlip
+    bool flip1h = bias1h != bias1h[1] and bias1h != 0 and bias1h[1] != 0
+    bool flip4h = bias4h != bias4h[1] and bias4h != 0 and bias4h[1] != 0
+    if flip1h
+        string dir = bias1h == 1 ? "bull" : "bear"
+        if wantText
+            alert("HTF 1H Bias Flipped → " + (bias1h == 1 ? "Bullish" : "Bearish"), alert.freq_once_per_bar_close)
+        if wantJson
+            alert('{"secret":"' + webhookSecret + '","symbol":"' + symTicker + '","action":"bias_flip","timeframe":"1H","direction":"' + dir + '"}', alert.freq_once_per_bar_close)
+    if flip4h
+        string dir4 = bias4h == 1 ? "bull" : "bear"
+        if wantText
+            alert("HTF 4H Bias Flipped → " + (bias4h == 1 ? "Bullish" : "Bearish"), alert.freq_once_per_bar_close)
+        if wantJson
+            alert('{"secret":"' + webhookSecret + '","symbol":"' + symTicker + '","action":"bias_flip","timeframe":"4H","direction":"' + dir4 + '"}', alert.freq_once_per_bar_close)
+
+var table biasTbl = table.new(position.bottom_right, 2, 6, border_width=1, border_color=color.new(color.gray, 70))
+
+f_biasCell(int row, string tfTxt, int b) =>
+    color  cellCol = b ==  1 ? color.new(bullColor, 25) : b == -1 ? color.new(bearColor, 25) : color.new(color.gray, 60)
+    string bTxt    = b ==  1 ? "Bullish" : b == -1 ? "Bearish" : "—"
+    table.cell(biasTbl, 0, row, tfTxt, text_color=txtColor,    text_size=size.small, bgcolor=color.new(color.gray, 85))
+    table.cell(biasTbl, 1, row, bTxt,  text_color=color.white, text_size=size.small, bgcolor=cellCol)
+
+if showBias and barstate.islast
+    table.cell(biasTbl, 0, 0, "HTF",  text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+    table.cell(biasTbl, 1, 0, "Bias", text_color=txtColor, text_size=size.small, bgcolor=color.new(color.gray, 80))
+    f_biasCell(1, "5m",  bias5m)
+    f_biasCell(2, "15m", bias15m)
+    f_biasCell(3, "1H",  bias1h)
+    f_biasCell(4, "4H",  bias4h)
+    f_biasCell(5, "12H", bias12h)

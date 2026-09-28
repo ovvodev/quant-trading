@@ -1,0 +1,341 @@
+//@version=6
+indicator(title="Strong Buy/Sell",shorttitle="Strong Buy/Sell",overlay = true,max_labels_count = 500,max_bars_back= 5000)
+
+// ══════════════════════════════════════
+// CONSTANTS
+// ══════════════════════════════════════
+GRP_MAIN    = "⚙️ Main Settings"
+GRP_SIGNAL  = "📡 Signal Tuning"
+GRP_VISUAL  = "🎨 Visual Settings"
+GRP_FILTER  = "🔍 Filters"
+GRP_COLORS  = "🎨 Colors"
+
+INDICATOR_VERSION = "v1.1.0"
+
+// ══════════════════════════════════════
+// INPUTS — Main Settings
+// ══════════════════════════════════════
+sensitivityInput = input.float(2.5,"Trend Sensitivity",minval = 0.5,maxval = 8.0,step = 0.1,group = GRP_MAIN,tooltip = "Controls the Adaptive Volatility Trend Engine responsiveness.\n• Lower = more signals, faster reaction, more noise\n• Higher = fewer signals, smoother, more reliable\n• Recommended: 1.5–4.0")
+
+atrPeriodInput = input.int(21,"ATR Period",minval = 5,maxval = 100,group = GRP_MAIN,tooltip = "Lookback for volatility measurement.\n• Lower = reacts faster to volatility changes\n• Higher = smoother volatility estimate\n• Recommended: 14–30")
+
+sourceInput = input.source(close,"Source",group = GRP_MAIN,tooltip = "Price source for calculations. Close is recommended for most strategies")
+
+presetInput = input.string("Balanced","Preset",options = ["Conservative", "Balanced", "Aggressive", "Scalping"],group = GRP_MAIN,tooltip = "Quick presets:\n• Conservative: fewer signals, higher win rate, for swing\n• Balanced: default, good for 15M-4H\n• Aggressive: more signals, faster entries\n• Scalping: optimized for 1-5M, tighter bands")
+
+// ══════════════════════════════════════
+// INPUTS — Signal Tuning
+// ══════════════════════════════════════
+minScoreInput = input.int(55,"Min Signal Score (0-100)",minval = 10,maxval = 95,step = 5,group = GRP_SIGNAL,tooltip = "Minimum confluence score to trigger a signal.\n• Higher = fewer but stronger signals\n• Lower = more signals, more noise\n• 40-60 for most strategies, 70+ for conservative")
+
+showStrongOnlyInput = input.bool(false,"Strong Signals Only (75+)",group = GRP_SIGNAL,tooltip = "Only show signals with confluence score ≥ 75. Best for swing trading")
+
+showPullbackInput = input.bool(true,"Show Pullback Signals",group = GRP_SIGNAL,tooltip = "Show pullback entries when price retraces to trend support/resistance within established trend")
+
+pullbackSensInput = input.int(8,"Pullback Sensitivity",minval = 3,maxval = 20,group = GRP_SIGNAL,tooltip = "Lookback for pullback detection.\n• Lower = detects smaller pullbacks\n• Higher = requires deeper retracement")
+
+// ══════════════════════════════════════
+// INPUTS — Filters
+// ══════════════════════════════════════
+useVolFilterInput = input.bool(false,"Volume Filter",group = GRP_FILTER,tooltip = "Only show signals with above-average volume confirmation. Auto-disabled for instruments without volume (forex)")
+
+useAdxFilterInput = input.bool(false,"ADX Trend Strength Filter",group = GRP_FILTER,tooltip = "Only show signals when ADX > 20 (trending market). Filters out ranging/choppy conditions")
+
+useMomentumFilterInput = input.bool(false,"Momentum Filter",group = GRP_FILTER,tooltip = "Only show signals with momentum confirmation (MACD histogram aligned)")
+
+// ══════════════════════════════════════
+// INPUTS — Visual
+// ══════════════════════════════════════
+themeInput = input.string("Auto","Theme",options = ["Auto", "Dark", "Light"],group = GRP_VISUAL,tooltip = "Chart color theme.\n• Auto: detects from chart background\n• Dark: optimized for dark backgrounds\n• Light: optimized for light/white backgrounds")
+
+showSignalsInput = input.bool(true,"Show Buy/Sell Signals",group = GRP_VISUAL,tooltip = "Display buy/sell signal labels on chart")
+
+// ══════════════════════════════════════
+// INPUTS — Colors
+// ══════════════════════════════════════
+bullColorInput = input.color(#089981,"Bull",inline = "colors1",group = GRP_COLORS)
+bearColorInput = input.color(#FF5252,"Bear",inline = "colors1",group = GRP_COLORS)
+neutralColorInput = input.color(#FFEB3B,"Neutral",inline = "colors1",group = GRP_COLORS)
+
+// ══════════════════════════════════════
+// THEME DETECTION & PALETTE
+// ══════════════════════════════════════
+isDark = switch themeInput
+    "Dark"  => true
+    "Light" => false
+    => color.r(chart.bg_color) < 128
+
+TEXT_COLOR = isDark ? #E0E0E0 : #1A1A1A
+TEXT_MUTED = isDark ? color.new(#9E9E9E, 0) : color.new(#757575, 0)
+LABEL_TEXT = #FFFFFF
+
+BULL_BG = color.new(bullColorInput, 85)
+BEAR_BG = color.new(bearColorInput, 85)
+
+// ══════════════════════════════════════
+// FUNCTIONS
+// ══════════════════════════════════════
+
+// Safe division — prevent na and division by zero
+safeDiv(float num, float den, float fallback = 0.0) =>
+    den != 0 and not na(num) and not na(den) ? num / den : fallback
+
+// Ehlers Super Smoother (2-pole)
+ehlersSS(float src, int period) =>
+    float a1 = math.exp(-math.sqrt(2) * math.pi / math.max(period, 2))
+    float b1 = 2.0 * a1 * math.cos(math.sqrt(2) * math.pi / math.max(period, 2))
+    float c2 = b1
+    float c3 = -a1 * a1
+    float c1 = 1.0 - c2 - c3
+    var float ss = na
+    ss := bar_index < 3 ? nz(src, 0.0) : c1 * (src + nz(src[1], src)) * 0.5 + c2 * nz(ss[1], src) + c3 * nz(ss[2], src)
+    ss
+
+// Adaptive ATR using Kaufman efficiency ratio
+adaptiveAtr(int period) =>
+    float rawAtr = nz(ta.atr(period), 0.0)
+    float direction = math.abs(close - close[period])
+    float volatility = math.sum(math.abs(close - close[1]), period)
+    float er = safeDiv(direction, volatility, 0.5)
+    float fastSc = 2.0 / 3.0
+    float slowSc = 2.0 / 31.0
+    float sc = math.pow(er * (fastSc - slowSc) + slowSc, 2)
+    var float aAtr = na
+    aAtr := na(aAtr[1]) ? rawAtr : aAtr[1] + sc * (rawAtr - aAtr[1])
+    aAtr
+
+// Adaptive Volatility Trend Engine (AVTE)
+avte(float src, float factor, int atrLen) =>
+    float filteredPrice = ehlersSS(src, math.max(math.round(atrLen / 2), 3))
+    float aAtr = adaptiveAtr(atrLen)
+    float upperBand = filteredPrice + factor * aAtr
+    float lowerBand = filteredPrice - factor * aAtr
+
+    var float upper = na
+    var float lower = na
+    var int dir = 1
+    var float trendLine = na
+
+    lower := nz(lower[1], lowerBand)
+    upper := nz(upper[1], upperBand)
+
+    lower := lowerBand > lower or close[1] < lower ? lowerBand : lower
+    upper := upperBand < upper or close[1] > upper ? upperBand : upper
+
+    if close > upper
+        dir := 1
+    else if close < lower
+        dir := -1
+
+    trendLine := dir == 1 ? lower : upper
+
+    [trendLine, dir, filteredPrice, aAtr]
+
+// ══════════════════════════════════════
+// PRESET APPLICATION
+// ══════════════════════════════════════
+float effectiveSensitivity = switch presetInput
+    "Conservative" => sensitivityInput * 1.4
+    "Aggressive"   => sensitivityInput * 0.7
+    "Scalping"     => sensitivityInput * 0.5
+    => sensitivityInput
+
+int effectiveAtr = switch presetInput
+    "Conservative" => math.round(atrPeriodInput * 1.3)
+    "Aggressive"   => math.round(atrPeriodInput * 0.8)
+    "Scalping"     => math.round(atrPeriodInput * 0.6)
+    => atrPeriodInput
+
+int effectiveMinScore = switch presetInput
+    "Conservative" => math.max(minScoreInput, 70)
+    "Aggressive"   => math.min(minScoreInput, 45)
+    "Scalping"     => math.min(minScoreInput, 40)
+    => minScoreInput
+
+// ══════════════════════════════════════
+// SHARED INDICATORS
+// ══════════════════════════════════════
+float ema50  = nz(ta.ema(close, 50), close)
+float ema200 = nz(ta.ema(close, 200), close)
+
+// MACD
+float macdFastLine = nz(ta.ema(close, 12), close)
+float macdSlowLine = nz(ta.ema(close, 26), close)
+float macdLine     = macdFastLine - macdSlowLine
+float macdSignal   = nz(ta.ema(macdLine, 9), 0.0)
+float macdHist     = macdLine - macdSignal
+
+// ADX
+[diP, diM, adxVal] = ta.dmi(14, 14)
+float adxSafe = nz(adxVal, 0.0)
+
+// Volume
+bool hasVolume   = nz(volume, 0) > 0
+float volSma20   = hasVolume ? nz(ta.sma(volume, 20), 0.0) : 0.0
+float volEmaFast = hasVolume ? nz(ta.ema(volume, 10), 0.0) : 0.0
+float volEmaSlow = hasVolume ? nz(ta.ema(volume, 25), 0.0) : 0.0
+
+// RSI
+float rsi14 = nz(ta.rsi(close, 14), 50.0)
+
+// ══════════════════════════════════════
+// CALCULATIONS — Core Engine
+// ══════════════════════════════════════
+int WARMUP_BARS = math.max(effectiveAtr * 3, 200)
+bool isWarmedUp = bar_index >= WARMUP_BARS
+
+// AVTE — main trend engine
+[avteLine, avteDir, filteredSrc, aAtr] = avte(
+     sourceInput,
+     effectiveSensitivity,
+     effectiveAtr)
+
+// Previous direction for crossover detection
+int prevDir = nz(avteDir[1], avteDir)
+
+bool trendFlipBull = avteDir == 1 and prevDir == -1
+bool trendFlipBear = avteDir == -1 and prevDir == 1
+
+// ══════════════════════════════════════
+// MOMENTUM SCORE — Symmetric (0-100)
+// ══════════════════════════════════════
+calcMomentumScore() =>
+    float score = 50.0
+
+    // Factor 1: EMA alignment (±15)
+    bool emaAlignBull = close > ema50 and ema50 > ema200
+    bool emaAlignBear = close < ema50 and ema50 < ema200
+
+    score += emaAlignBull ? 15.0 : emaAlignBear ? -15.0 : 0.0
+
+    // Factor 2: RSI position (±10)
+    score += (rsi14 > 50 and rsi14 < 70) ? 10.0 :
+             (rsi14 <= 50 and rsi14 > 30) ? -10.0 : 0.0
+
+    // Factor 3: MACD histogram (±12)
+    score += (macdHist > 0 and macdHist > macdHist[1]) ? 12.0 :
+             (macdHist < 0 and macdHist < macdHist[1]) ? -12.0 : 0.0
+
+    // Factor 4: Volume confirmation (±8)
+    bool volAbove = hasVolume and volume > volSma20 * 1.2
+    bool volBelow = hasVolume and volume < volSma20 * 0.8
+
+    float priceChg = close - close[1]
+
+    score += volAbove and priceChg > 0 ? 8.0 :
+             volAbove and priceChg < 0 ? -8.0 :
+             volBelow ? (priceChg > 0 ? -4.0 : 4.0) : 0.0
+
+    // Factor 5: ADX strength (±8)
+    bool adxTrending = adxSafe > 20
+
+    score += adxTrending and diP > diM ? 8.0 :
+             adxTrending and diM > diP ? -8.0 : 0.0
+
+    math.max(0.0, math.min(100.0, score))
+
+float mScore = calcMomentumScore()
+
+// ══════════════════════════════════════
+// FILTERS
+// ══════════════════════════════════════
+bool volConfirm = hasVolume ? volEmaFast > volEmaSlow : true
+bool adxConfirm = adxSafe > 20.0
+
+bool momentumBull = macdHist > 0 and macdHist > macdHist[1]
+bool momentumBear = macdHist < 0 and macdHist < macdHist[1]
+
+bool volFilterOk = useVolFilterInput ? volConfirm : true
+bool adxFilterOk = useAdxFilterInput ? adxConfirm : true
+bool bullMomOk   = useMomentumFilterInput ? momentumBull : true
+bool bearMomOk   = useMomentumFilterInput ? momentumBear : true
+
+bool bullFiltersPass = volFilterOk and adxFilterOk and bullMomOk
+bool bearFiltersPass = volFilterOk and adxFilterOk and bearMomOk
+
+// ══════════════════════════════════════
+// SIGNAL LOGIC
+// ══════════════════════════════════════
+int minScore = showStrongOnlyInput ?
+     math.max(effectiveMinScore, 75) :
+     effectiveMinScore
+
+int sellThreshold = 100 - minScore
+
+bool rawBuy =
+     trendFlipBull and
+     mScore >= minScore and
+     bullFiltersPass
+
+bool rawSell =
+     trendFlipBear and
+     mScore <= sellThreshold and
+     bearFiltersPass
+
+bool confirmedBuy =
+     rawBuy and
+     barstate.isconfirmed and
+     isWarmedUp
+
+bool confirmedSell =
+     rawSell and
+     barstate.isconfirmed and
+     isWarmedUp
+
+bool isStrongBuy  = confirmedBuy and mScore >= 75
+bool isStrongSell = confirmedSell and mScore <= 25
+
+// ══════════════════════════════════════
+// PULLBACK SIGNALS
+// ══════════════════════════════════════
+float pullRsi = nz(ta.rsi(close, pullbackSensInput), 50.0)
+float pullEma = nz(ta.ema(close, pullbackSensInput * 3), close)
+
+bool pullbackBuyRaw =
+     showPullbackInput and
+     avteDir == 1 and
+     not trendFlipBull and
+     close <= pullEma and
+     pullRsi < 35 and
+     pullRsi > pullRsi[1]
+
+bool pullbackSellRaw =
+     showPullbackInput and
+     avteDir == -1 and
+     not trendFlipBear and
+     close >= pullEma and
+     pullRsi > 65 and
+     pullRsi < pullRsi[1]
+
+// Apply active filters
+bool pullbackBuy =
+     pullbackBuyRaw and
+     bullFiltersPass and
+     barstate.isconfirmed and
+     isWarmedUp
+
+bool pullbackSell =
+     pullbackSellRaw and
+     bearFiltersPass and
+     barstate.isconfirmed and
+     isWarmedUp
+
+// ══════════════════════════════════════
+// LABELS — Buy/Sell Signals
+// ══════════════════════════════════════
+plotshape(showSignalsInput and confirmedBuy and isStrongBuy ? low : na,"Strong Buy",shape.labelup,location.belowbar,bullColorInput,text = "Strong\nBuy",textcolor = LABEL_TEXT,size = size.tiny)
+
+plotshape(showSignalsInput and confirmedSell and isStrongSell ? high : na,"Strong Sell",shape.labeldown,location.abovebar,bearColorInput,text = "Strong\nSell",textcolor = LABEL_TEXT,size = size.tiny)
+
+// ══════════════════════════════════════
+// 9 EMA COLOR LINE
+// ══════════════════════════════════════
+len = input.int(9,minval = 1,title = "EMA Length")
+src = input(close,title = "Source")
+ema9 = ta.ema(src, len)
+
+emaColor = close > ema9 ?
+         color.green :
+         color.red
+
+plot(ema9,color = emaColor,linewidth = 2)
